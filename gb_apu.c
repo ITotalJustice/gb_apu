@@ -177,6 +177,18 @@ static const uint8_t IO_READ_VALUE[0x40] = {
     [0x3F] = 0x00, // WAVE RAM
 };
 
+// initial values of wave ram when powered on.
+static const uint8_t WAVE_RAM_INITIAL[2][0x10] = {
+    [GbApuType_DMG] = {
+        0x84, 0x40, 0x43, 0xAA, 0x2D, 0x78, 0x92, 0x3C,
+        0x60, 0x59, 0x59, 0xB0, 0x34, 0xB8, 0x2E, 0xDA,
+    },
+    [GbApuType_CGB] = {
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+    },
+};
+
 static inline bool is_apu_enabled(const struct GbApu* apu)
 {
     return REG_NR52 & 0x80;
@@ -286,6 +298,12 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
         from = base_clock + until;
     }
 
+    // needed to pass blarggs dmg 09-wave and 12-wave
+    if (num == ChannelType_WAVE)
+    {
+        apu->wave.just_accessed = false;
+    }
+
     if (!is_apu_enabled(apu) || !channel_is_enabled(apu, num))
     {
         add_delta(apu, c, from, 0, 0);
@@ -307,13 +325,14 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
     if (num == ChannelType_SQUARE0 || num == ChannelType_SQUARE1)
     {
         struct GbApuSquare* square = &apu->square[num];
+        const int envelope = apu->env[num].volume;
 
         const unsigned duty = apu->io[SQAURE_DUTY_ADDR[num]] >> 6;
         unsigned duty_bit = SQUARE_DUTY_CYCLES[duty][square->duty_index];
         const int sign_flipflop = duty_bit ? +1 : -1;
 
-        int left = blip_apply_volume_to_sample(apu->blip, c->env.volume * left_volume * sign_flipflop, volume);
-        int right = blip_apply_volume_to_sample(apu->blip, c->env.volume * right_volume * sign_flipflop, volume);
+        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop, volume);
+        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop, volume);
         add_delta(apu, c, from, left, 0);
         add_delta(apu, c, from, right, 1);
 
@@ -338,6 +357,7 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
     {
         struct GbApuWave* wave = &apu->wave;
 
+        const bool will_tick = c->frequency_timer <= 0;
         const unsigned volume_divider = WAVE_VOLUME_DIVIDER[(REG_NR32 >> 5) & 0x3];
         int sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
         sample = (sample * 2 - 15) >> volume_divider; // [-15,+15]
@@ -369,16 +389,19 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
             c->frequency_timer += freq;
         }
 
+        // if ticked, and timer==freq, that means it was accessed on this very cycle
+        wave->just_accessed = will_tick && c->frequency_timer == freq;
     }
     else if (num == ChannelType_NOISE)
     {
         struct GbApuNoise* noise = &apu->noise;
+        const int envelope = apu->env[num].volume;
 
         unsigned bit0 = noise->lfsr & 0x1;
         const int sign_flipflop = bit0 ? -1 : +1; // inverted
 
-        int left = blip_apply_volume_to_sample(apu->blip, c->env.volume * left_volume * sign_flipflop, volume);
-        int right = blip_apply_volume_to_sample(apu->blip, c->env.volume * right_volume * sign_flipflop, volume);
+        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop, volume);
+        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop, volume);
         add_delta_fast(apu, c, from, left, 0);
         add_delta_fast(apu, c, from, right, 1);
 
@@ -515,8 +538,6 @@ static void sweep_trigger(struct GbApu* apu)
     apu->sweep.enabled = (period != 0) || (shift != 0);
 
     // sweep calc is performed, but the value isn't updated
-    // this means that it only really checks if the value overflows
-    // if it does, then ch1 is disabled.
     if (shift)
     {
         sweep_do_freq_calc(apu, false);
@@ -530,9 +551,10 @@ static bool len_is_enabled(const struct GbApu* apu, unsigned num)
 
 static void len_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
 {
-    struct GbApuLen* len = &apu->channels[num].len;
+    struct GbApuLen* len = &apu->len[num];
 
-    if (channel_is_enabled(apu, num) && len_is_enabled(apu, num) && len->counter > 0)
+    // len is still clocked, even with the channel disabled.
+    if (len_is_enabled(apu, num) && len->counter > 0)
     {
         len->counter--;
         if (len->counter == 0)
@@ -545,7 +567,7 @@ static void len_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned l
 
 static void len_on_nrx4_edge_case_write(struct GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
 {
-    struct GbApuLen* len = &apu->channels[num].len;
+    struct GbApuLen* len = &apu->len[num];
 
     const unsigned old_enabled = old_value & 0x40;
     const unsigned new_enabled = new_value & 0x40;
@@ -565,7 +587,7 @@ static void len_on_nrx4_edge_case_write(struct GbApu* apu, unsigned num, unsigne
 
 static void len_trigger(struct GbApu* apu, unsigned num)
 {
-    struct GbApuLen* len = &apu->channels[num].len;
+    struct GbApuLen* len = &apu->len[num];
 
     if (len->counter == 0)
     {
@@ -579,7 +601,7 @@ static void len_trigger(struct GbApu* apu, unsigned num)
 
 static void env_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
 {
-    struct GbApuEnvelope* env = &apu->channels[num].env;
+    struct GbApuEnvelope* env = &apu->env[num];
 
     if (channel_is_enabled(apu, num) && !env->disable)
     {
@@ -612,7 +634,8 @@ static void env_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned l
 
 static void env_trigger(struct GbApu* apu, unsigned num)
 {
-    struct GbApuEnvelope* env = &apu->channels[num].env;
+    // struct GbApuEnvelope* env = &apu->channels[num].env;
+    struct GbApuEnvelope* env = &apu->env[num];
 
     const unsigned reg = apu->io[ENV_REG_ADDR[num]];
     const unsigned period = reg & 0x7;
@@ -640,17 +663,35 @@ static void env_write(struct GbApu* apu, unsigned num, unsigned new_value, unsig
 
 static void trigger(struct GbApu* apu, unsigned num, unsigned time)
 {
-    channel_enable(apu, num);
-    const unsigned new_freq = channel_get_frequency(apu, num);
     struct GbApuChannel* c = &apu->channels[num];
+    const unsigned new_freq = channel_get_frequency(apu, num);
+    const bool was_enabled = channel_is_enabled(apu, num);
 
+    channel_enable(apu, num);
     len_trigger(apu, num);
 
     if (num == ChannelType_WAVE)
     {
-        apu->wave.position_counter = 0;
-        // 6 cycle delay until first clock
+        // wave ram is partially corrupted on dmg if triggered while enabled
+        // the apu is ticked at 2mhz, but i tick it at 4mhz.
+        // to get around this, check if the next access is within 2 cycles.
+        if (apu->type == GbApuType_DMG && was_enabled && c->frequency_timer <= 2)
+        {
+            unsigned index = ((apu->wave.position_counter + 1) % 32) >> 1;
+            if (index < 4)
+            {
+                REG_WAVE_TABLE[0] = REG_WAVE_TABLE[index];
+            }
+            else
+            {
+                index &= ~0x3;
+                memcpy(REG_WAVE_TABLE, REG_WAVE_TABLE + index, 4);
+            }
+        }
+
+        // https://forums.nesdev.org/viewtopic.php?t=13730
         c->frequency_timer = new_freq + 6;
+        apu->wave.position_counter = 0;
     }
     else
     {
@@ -711,7 +752,8 @@ static void on_nrx1_write(struct GbApu* apu, unsigned num, unsigned time, unsign
 {
     const unsigned reload_value = LEN_RELOAD_VALUE[num];
     const unsigned mask = reload_value - 1;
-    apu->channels[num].len.counter = reload_value - (new_value & mask);
+    // apu->channels[num].len.counter = reload_value - (new_value & mask);
+    apu->len[num].counter = reload_value - (new_value & mask);
 }
 
 static void on_nrx2_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
@@ -782,10 +824,10 @@ void apu_quit(struct GbApu* apu)
     }
 }
 
-void apu_reset(struct GbApu* apu, unsigned skip_bios)
+void apu_reset(struct GbApu* apu, enum GbApuType type)
 {
     apu_clear_samples(apu);
-
+    apu->type = type;
     memset(&apu->channels, 0, sizeof(apu->channels));
     memset(&apu->sweep, 0, sizeof(apu->sweep));
     memset(&apu->square, 0, sizeof(apu->square));
@@ -793,41 +835,8 @@ void apu_reset(struct GbApu* apu, unsigned skip_bios)
     memset(&apu->noise, 0, sizeof(apu->noise));
     memset(&apu->frame_sequencer, 0, sizeof(apu->frame_sequencer));
     memset(apu->io + 0x10, 0, 0x17);
-
+    memcpy(REG_WAVE_TABLE, WAVE_RAM_INITIAL[type], 0x10);
     apu->noise.lfsr = 0x7FFF;
-
-    // for (int i = 0; i < 4; i++)
-    // {
-    //     apu->channels[i].env.disable = true;
-    // }
-
-    // todo: confirm the below
-    if (skip_bios)
-    {
-        REG_NR10 = 0x80;
-        REG_NR11 = 0xBF;
-        REG_NR12 = 0xF3;
-        REG_NR14 = 0xBF;
-        REG_NR21 = 0x3F;
-        REG_NR22 = 0x00;
-        REG_NR24 = 0xBF;
-        REG_NR30 = 0x7F;
-        REG_NR31 = 0xFF;
-        REG_NR32 = 0x9F;
-        REG_NR33 = 0xBF;
-        REG_NR41 = 0xFF;
-        REG_NR42 = 0x00;
-        REG_NR44 = 0xBF;
-        REG_NR50 = 0x77;
-        REG_NR51 = 0xF3;
-        REG_NR52 = 0xF1;
-    }
-
-    for (int i = 0; i < 0x10; i+= 2)
-    {
-        REG_WAVE_TABLE[i + 0] = 0x00;
-        REG_WAVE_TABLE[i + 1] = 0xFF;
-    }
 }
 
 unsigned apu_read_io(struct GbApu* apu, unsigned addr, unsigned time)
@@ -837,20 +846,15 @@ unsigned apu_read_io(struct GbApu* apu, unsigned addr, unsigned time)
 
     if (addr >= 0x30 && addr <= 0x3F && channel_is_enabled(apu, ChannelType_WAVE))
     {
-        #if 1
-        // dmg behaviour
-        if (time - apu->channels[ChannelType_WAVE].timestamp < 6)
+        channel_sync(apu, ChannelType_WAVE, time, 0);
+        if (apu->type == GbApuType_CGB || apu->wave.just_accessed)
         {
             return REG_WAVE_TABLE[apu->wave.position_counter >> 1];
         }
-        else
+        else // if (apu->type == GbApuType_CGB)
         {
-            return 0xFF;
+            return 0xFF; // writes to dmg are ignored if wave wasn't just accessed
         }
-        #else
-        // cgb always returns from the table.
-        return REG_WAVE_TABLE[apu->wave.position_counter >> 1];
-        #endif
     }
 
     return apu->io[addr] | IO_READ_VALUE[addr];
@@ -869,11 +873,32 @@ void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned tim
         {
             channel_sync_all(apu, time, 0);
 
+            // len counters are unaffected on the dmg
+            const unsigned nr11 = REG_NR11 & 0x3F;
+            const unsigned nr21 = REG_NR21 & 0x3F;
+            const unsigned nr31 = REG_NR31;
+            const unsigned nr41 = REG_NR41;
+
             // reset everything aside from wave ram
             memset(apu->io + 0x10, 0, 0x17);
-            apu->square[0].duty_index = 0;
-            apu->square[1].duty_index = 0;
-            apu->wave.sample_buffer = 0;
+            memset(&apu->sweep, 0, sizeof(apu->sweep));
+            memset(&apu->square, 0, sizeof(apu->square));
+            memset(&apu->wave, 0, sizeof(apu->wave));
+            memset(&apu->noise, 0, sizeof(apu->noise));
+            memset(&apu->frame_sequencer, 0, sizeof(apu->frame_sequencer));
+            memset(&apu->env, 0, sizeof(apu->env));
+
+            if (apu->type == GbApuType_DMG)
+            {
+                REG_NR11 = nr11;
+                REG_NR21 = nr21;
+                REG_NR31 = nr31;
+                REG_NR41 = nr41;
+            }
+            else
+            {
+                memset(&apu->len, 0, sizeof(apu->len));
+            }
         }
         // check if it's now enabled
         else if (!is_apu_enabled(apu) && (value & 0x80))
@@ -882,31 +907,42 @@ void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned tim
             apu->frame_sequencer.index = 0;
         }
     }
-    // writes to the apu are ignore whilst disabled
-    else if (!is_apu_enabled(apu))
-    {
-        return;
-    }
-    else if (addr == 0x24 || addr == 0x25) // nr50 | nr51
-    {
-        channel_sync_all(apu, time, 0);
-        apu->io[addr] = value;
-    }
+    // wave ram is always accessable
     else if (addr >= 0x30 && addr <= 0x3F) // wave ram
     {
-        channel_sync(apu, ChannelType_WAVE, time, 0);
-
         // if enabled, writes are ignored on dmg, allowed on cgb.
         if (channel_is_enabled(apu, ChannelType_WAVE))
         {
-            // will this reset the position counter?
-            // does the channel play this newly written value?
-            REG_WAVE_TABLE[apu->wave.position_counter >> 1] = value;
+            channel_sync(apu, ChannelType_WAVE, time, 0);
+            if (apu->type == GbApuType_CGB || apu->wave.just_accessed)
+            {
+                REG_WAVE_TABLE[apu->wave.position_counter >> 1] = value;
+            }
         }
         else
         {
             apu->io[addr] = value;
         }
+    }
+    // writes to the apu are ignore whilst disabled
+    else if (!is_apu_enabled(apu))
+    {
+        // len counters are writeable even if apu is off
+        if (apu->type == GbApuType_DMG && (addr == 0x11 || addr == 0x16 || addr == 0x1B || addr == 0x20))
+        {
+            const unsigned num = IO_CHANNEL_NUM[addr] & 0x3;
+            const unsigned old_value = apu->io[addr];
+            const unsigned reload_value = LEN_RELOAD_VALUE[num];
+            const unsigned mask = reload_value - 1;
+            apu->io[addr] = (apu->io[addr] & ~mask) | (value & mask);
+
+            on_nrx1_write(apu, num, time, apu->io[addr], old_value);
+        }
+    }
+    else if (addr == 0x24 || addr == 0x25) // nr50 | nr51
+    {
+        channel_sync_all(apu, time, 0);
+        apu->io[addr] = value;
     }
     else
     {

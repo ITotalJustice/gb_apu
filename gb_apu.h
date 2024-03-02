@@ -8,6 +8,12 @@
 extern "C" {
 #endif
 
+enum GbApuType
+{
+    GbApuType_DMG,
+    GbApuType_CGB,
+};
+
 struct GbApuFrameSequencer
 {
     unsigned index;
@@ -42,6 +48,7 @@ struct GbApuWave
 {
     unsigned sample_buffer;
     unsigned position_counter;
+    unsigned just_accessed;
 };
 
 struct GbApuNoise
@@ -54,16 +61,19 @@ struct GbApuChannel
     unsigned clock; /* clock used for blip_buf. */
     unsigned timestamp; /* timestamp since last tick(). */
     int amp[2]; /* last volume output left/right. */
-
     int frequency_timer; /* freq that's counted down every tick. */
-    struct GbApuLen len; /* every channel has one. */
-    struct GbApuEnvelope env; /* all channels bar wave. */
 };
 
 struct GbApu
 {
+    blip_wrap_t* blip;
+    float channel_volume[4];
+    enum GbApuType type;
+
     /* for savestates, back up everything here. */
     struct GbApuChannel channels[4];
+    struct GbApuLen len[4]; /* every channel has one. */
+    struct GbApuEnvelope env[4]; /* all channels bar wave. */
     struct GbApuSweep sweep;
     struct GbApuSquare square[2];
     struct GbApuWave wave;
@@ -71,9 +81,6 @@ struct GbApu
     struct GbApuFrameSequencer frame_sequencer;
     uint8_t io[0x40];
     /* end. */
-
-    blip_wrap_t* blip;
-    float channel_volume[4];
 };
 
 /* ensure you call this at start-up */
@@ -81,7 +88,7 @@ void apu_init(struct GbApu*, double clock_rate, double sample_rate);
 /* call to free allocated memory by blip buf. */
 void apu_quit(struct GbApu*);
 /* clock_rate should be the cpu speed of the system. */
-void apu_reset(struct GbApu*, unsigned skip_bios);
+void apu_reset(struct GbApu*, enum GbApuType type);
 
 /* reads from io register, unused bits are set to 1. */
 unsigned apu_read_io(struct GbApu*, unsigned addr, unsigned time);

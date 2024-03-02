@@ -5,7 +5,7 @@ option(GB_APU_CXX "build with Blip_Buffer.cpp, gives access to bass and treble c
 
 
 project(gb_apu
-    VERSION 2.0.0
+    VERSION 1.1.0
     LANGUAGES C
 )
 

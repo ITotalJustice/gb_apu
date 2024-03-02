@@ -8,9 +8,19 @@ when using this library, you have the choice between using blip_buf or Blip_buff
 
 using the latter will allow you to have bass and treble control, as well as sounding slightly better sounds slightly better. Other than that, both function the same and the api remains the same, and the exposed api doesn't change.
 
-The `C` version compiles down to ~24 KiB in release mode.
+The `C` version compiles down to ~25 KiB in release mode.
 
-The `CXX` version compiles down to ~33.2 KiB in release mode.
+The `CXX` version compiles down to ~34 KiB in release mode.
+
+---
+
+## Accurary
+
+gb_apu passes all of [blarggs dmg_sound and cgb_sound tests](https://gbdev.gg8.se/wiki/articles/Test_ROMs) and all audio tests in [numism](https://github.com/pinobatch/numism).
+
+The level of accurary does depend on your emulation of the Gameboy timer. For example, the `apu_frame_sequencer_clock()` should be called on the falling edge (bit goes from 1 -> 0) of bit 4 of `DIV`. In double speed mode, this is the falling edge of bit 5. Be aware that DIV can be written to which sets `DIV` to 0, which could cause an early clock, or, result in no clocks if `DIV` is written to frequently.
+
+gb_apu currently doesn't emulate ["zombie mode"](https://gbdev.gg8.se/wiki/articles/Gameboy_sound_hardware#Obscure_Behavior) which will break the very few games that rely on it, Prehistorik Man is one such game.
 
 ---
 
@@ -50,7 +60,7 @@ include(FetchContent)
 
 FetchContent_Declare(gb_apu
     GIT_REPOSITORY https://github.com/ITotalJustice/gb_apu.git
-    GIT_TAG        v1.0.0
+    GIT_TAG        v1.1.0
 )
 
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
