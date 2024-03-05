@@ -51,7 +51,7 @@ you can also use the included cmake file:
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
 set(GB_APU_ZOMBIE OFF) # set ON for zombie mode emulation
 add_subdirectory(gb_apu)
-target_link_libraries(gb_apu PRIVATE rewind)
+target_link_libraries(your_exe PRIVATE gb_apu)
 ```
 
 or use cmake's fetch content:
@@ -65,9 +65,10 @@ FetchContent_Declare(gb_apu
 )
 
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
+set(GB_APU_ZOMBIE OFF) # set ON for zombie mode emulation
 FetchContent_MakeAvailable(gb_apu)
 
-target_link_libraries(your_exe PRIVATE rewind)
+target_link_libraries(your_exe PRIVATE gb_apu)
 ```
 
 ---
