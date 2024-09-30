@@ -1,8 +1,5 @@
-#ifndef _GB_APU_H_
-#define _GB_APU_H_
-
-#include <stdint.h>
-#include "blip_wrap.h"
+#ifndef GB_APU_H
+#define GB_APU_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,113 +9,132 @@ enum GbApuType
 {
     GbApuType_DMG,
     GbApuType_CGB,
+    GbApuType_AGB,
 };
 
-struct GbApuFrameSequencer
+/* TODO: agb filter. */
+enum GbApuFilter
 {
-    unsigned index;
+    GbApuFilter_NONE,
+    GbApuFilter_DMG,
+    GbApuFilter_CGB,
 };
 
-struct GbApuLen
+enum GbApuClockRate
 {
-    unsigned counter;
+    GbApuClockRate_DMG = 4194304,
+    GbApuClockRate_CGB = GbApuClockRate_DMG,
+    GbApuClockRate_AGB = GbApuClockRate_DMG * 4,
 };
 
-struct GbApuSweep
-{
-    unsigned freq_shadow_register;
-    unsigned timer;
-    unsigned enabled;
-    unsigned did_negate;
-};
+typedef struct GbApu GbApu;
+typedef void(*apu_agb_fifo_dma_request)(void* user, unsigned fifo_num, unsigned time);
 
-struct GbApuEnvelope
-{
-    unsigned volume;
-    unsigned timer;
-    unsigned disable;
-};
-
-struct GbApuSquare
-{
-    unsigned duty_index;
-};
-
-struct GbApuWave
-{
-    unsigned sample_buffer;
-    unsigned position_counter;
-    unsigned just_accessed;
-};
-
-struct GbApuNoise
-{
-    unsigned lfsr;
-};
-
-struct GbApuChannel
-{
-    unsigned clock; /* clock used for blip_buf. */
-    unsigned timestamp; /* timestamp since last tick(). */
-    int amp[2]; /* last volume output left/right. */
-    int frequency_timer; /* freq that's counted down every tick. */
-};
-
-struct GbApu
-{
-    blip_wrap_t* blip;
-    float channel_volume[4];
-    enum GbApuType type;
-
-    /* for savestates, back up everything here. */
-    struct GbApuChannel channels[4];
-    struct GbApuLen len[4]; /* every channel has one. */
-    struct GbApuEnvelope env[4]; /* all channels bar wave. */
-    struct GbApuSweep sweep;
-    struct GbApuSquare square[2];
-    struct GbApuWave wave;
-    struct GbApuNoise noise;
-    struct GbApuFrameSequencer frame_sequencer;
-    uint8_t io[0x40];
-    /* end. */
-};
-
-/* ensure you call this at start-up */
-void apu_init(struct GbApu*, double clock_rate, double sample_rate);
+/* ------------------------- */
+/* ------Initialise Api----- */
+/* ------------------------- */
+/* ensure you call this at start-up. */
+GbApu* apu_init(double clock_rate, double sample_rate);
 /* call to free allocated memory by blip buf. */
-void apu_quit(struct GbApu*);
+void apu_quit(GbApu*);
 /* clock_rate should be the cpu speed of the system. */
-void apu_reset(struct GbApu*, enum GbApuType type);
+void apu_reset(GbApu*, enum GbApuType type);
 
+/* ------------------------- */
+/* ------DMG Functions------ */
+/* ------------------------- */
 /* reads from io register, unused bits are set to 1. */
-unsigned apu_read_io(struct GbApu*, unsigned addr, unsigned time);
+unsigned apu_read_io(GbApu*, unsigned addr, unsigned time);
 /* writes to an io register. */
-void apu_write_io(struct GbApu*, unsigned addr, unsigned value, unsigned time);
+void apu_write_io(GbApu*, unsigned addr, unsigned value, unsigned time);
 /* call this on the falling edge of bit 4/5 of DIV. */
-void apu_frame_sequencer_clock(struct GbApu*, unsigned time, unsigned late);
+void apu_frame_sequencer_clock(GbApu*, unsigned time);
 
+/* ------------------------- */
+/* ------CGB Functions------ */
+/* ------------------------- */
+/* returns raw 4-bit sample value for each channel. */
+unsigned apu_cgb_read_pcm12(GbApu*, unsigned time);
+unsigned apu_cgb_read_pcm34(GbApu*, unsigned time);
+
+/* ------------------------- */
+/* ------AGB Functions------ */
+/* ------------------------- */
+/* translates agb addr to dmg and calls apu_read_io, unused bits are masked. */
+unsigned apu_agb_read8_io(GbApu*, unsigned addr, unsigned time);
+/* translates agb addr to dmg and calls apu_write_io. */
+void apu_agb_write8_io(GbApu*, unsigned addr, unsigned value, unsigned time);
+/* same as above for convenience. */
+unsigned apu_agb_read16_io(GbApu*, unsigned addr, unsigned time);
+void apu_agb_write16_io(GbApu*, unsigned addr, unsigned value, unsigned time);
+/* masks unused bits. */
+unsigned apu_agb_soundcnt_read(GbApu*, unsigned time);
+void apu_agb_soundcnt_write(GbApu*, unsigned value, unsigned time);
+/* currently unused. */
+unsigned apu_agb_soundbias_read(GbApu*, unsigned time);
+void apu_agb_soundbias_write(GbApu*, unsigned value, unsigned time);
+/* fifo writes differ based on address alignment. */
+void apu_agb_fifo_write8(GbApu*, unsigned addr, unsigned value);
+void apu_agb_fifo_write16(GbApu*, unsigned addr, unsigned value);
+void apu_agb_fifo_write32(GbApu*, unsigned addr, unsigned value);
+/* on timer overflow, the fifo can request for more data by starting a dma. */
+void apu_agb_timer_overflow(GbApu*, void* user, apu_agb_fifo_dma_request dma_callback, unsigned timer_num, unsigned time);
+
+/* ------------------------- */
+/* ------Advanced Api------- */
+/* ------------------------- */
+/* returns value of io register, without unused bits applied / masked, */
+/* regardless if the apu is enabled or not. */
+/* useful for gui io viewer. */
+unsigned apu_read_io_raw(const GbApu*, unsigned addr);
+unsigned apu_agb_read_io_raw(const GbApu*, unsigned addr);
+unsigned apu_agb_soundcnt_read_raw(const GbApu*);
+unsigned apu_agb_soundbias_read_raw(const GbApu*);
+
+/* ------------------------- */
+/* ------Configure Api------ */
+/* ------------------------- */
 /* channel volume, max range: 0.0 - 1.0. */
-void apu_set_channel_volume(struct GbApu*, unsigned channel_num, float volume);
+void apu_set_channel_volume(GbApu*, unsigned channel_num, float volume);
 /* master volume, max range: 0.0 - 1.0. */
-void apu_set_master_volume(struct GbApu*, float volume);
+void apu_set_master_volume(GbApu*, float volume);
 /* only available with Blip_Buffer. */
-void apu_set_bass(struct GbApu*, int frequency);
+void apu_set_bass(GbApu*, int frequency);
 /* only available with Blip_Buffer. */
-void apu_set_treble(struct GbApu*, double treble_db);
+void apu_set_treble(GbApu*, double treble_db);
+/* sets the filter that's applied to apu_read_samples(). */
+void apu_set_highpass_filter(GbApu*, enum GbApuFilter filter, double clock_rate, double sample_rate);
+/* charge factor should be in the range 0.0 - 1.0. */
+void apu_set_highpass_filter_custom(GbApu*, double charge_factor, double clock_rate, double sample_rate);
+/* updates timestamp, useful if the time overflows. */
+void apu_update_timestamp(GbApu*, int time);
 
+/* ------------------------- */
+/* ------Sample Output------ */
+/* ------------------------- */
 /* returns how many cycles are needed until sample_count == apu_samples_avaliable() */
-int apu_clear_clocks_needed(struct GbApu*, int sample_count);
-/* call this when you want to read out samples. */
-void apu_end_frame(struct GbApu*, unsigned time, unsigned late);
+int apu_clocks_needed(const GbApu*, int sample_count);
 /* returns how many samples are available, call apu_end_frame() first. */
-int apu_samples_avaliable(const struct GbApu*);
+int apu_samples_avaliable(const GbApu*);
+/* call this when you want to read out samples. */
+void apu_end_frame(GbApu*, unsigned time);
 /* read stereo samples, returns the amount read. */
-int apu_read_samples(struct GbApu*, short out[], int count);
+int apu_read_samples(GbApu*, short out[], int count);
 /* removes all samples. */
-void apu_clear_samples(struct GbApu*);
+void apu_clear_samples(GbApu*);
+
+/* ------------------------- */
+/* ------SaveState Api------ */
+/* ------------------------- */
+/* returns the size needed for savestates. */
+unsigned apu_state_size(void);
+/* creates a savestate, returns 0 on success. */
+int apu_save_state(const GbApu*, void* data, unsigned size);
+/* loads a savestate, returns 0 on success. */
+int apu_load_state(GbApu*, const void* data, unsigned size);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* _GB_APU_H_ */
+#endif /* GB_APU_H */

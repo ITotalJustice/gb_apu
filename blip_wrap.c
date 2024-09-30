@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-enum { VOLUME_MAX = 15 * 8 };
+enum { VOLUME_MAX = 0x200 * 2 - 1 };
 
 struct blip_wrap_t
 {
@@ -13,10 +13,22 @@ struct blip_wrap_t
 
 blip_wrap_t* blip_wrap_new(double sample_rate)
 {
-    blip_wrap_t* b = (blip_wrap_t*)malloc(sizeof(*b));
-    b->buf[0] = blip_new(sample_rate / 10);
-    b->buf[1] = blip_new(sample_rate / 10);
-    b->volume = 0;
+    blip_wrap_t* b = malloc(sizeof(*b));
+    if (b) {
+        b->volume = 0;
+        b->buf[0] = blip_new(sample_rate / 10);
+        b->buf[1] = blip_new(sample_rate / 10);
+
+        if (!b->buf[0] || !b->buf[1]) {
+            if (b->buf[0]) {
+                free(b->buf[0]); b->buf[0] = NULL;
+            }
+            if (b->buf[1]) {
+                free(b->buf[1]); b->buf[1] = NULL;
+            }
+            free(b); b = NULL;
+        }
+    }
     return b;
 }
 
@@ -36,10 +48,11 @@ void blip_wrap_delete(blip_wrap_t* b)
     }
 }
 
-void blip_wrap_set_rates(blip_wrap_t* b, double clock_rate, double sample_rate)
+int blip_wrap_set_rates(blip_wrap_t* b, double clock_rate, double sample_rate)
 {
     blip_set_rates(b->buf[0], clock_rate, sample_rate);
     blip_set_rates(b->buf[1], clock_rate, sample_rate);
+    return 0;
 }
 
 void blip_wrap_clear(blip_wrap_t* b)
@@ -60,10 +73,10 @@ void blip_wrap_add_delta_fast(blip_wrap_t* b, unsigned clock_time, int delta, in
 
 int blip_wrap_clocks_needed(const blip_wrap_t* b, int sample_count)
 {
-    return blip_clocks_needed(b->buf[0], sample_count);
+    return blip_clocks_needed(b->buf[0], sample_count / 2);
 }
 
-void blip_wrap_end_frame(blip_wrap_t* b, unsigned int clock_duration)
+void blip_wrap_end_frame(blip_wrap_t* b, unsigned clock_duration)
 {
     blip_end_frame(b->buf[0], clock_duration);
     blip_end_frame(b->buf[1], clock_duration);
@@ -71,18 +84,26 @@ void blip_wrap_end_frame(blip_wrap_t* b, unsigned int clock_duration)
 
 int blip_wrap_samples_avail(const blip_wrap_t* b)
 {
-    return blip_samples_avail(b->buf[0]);
+    return blip_samples_avail(b->buf[0]) * 2;
 }
 
 int blip_wrap_read_samples(blip_wrap_t* b, short out[], int count)
 {
     blip_read_samples(b->buf[0], out + 0, count / 2, 1);
-    return blip_read_samples(b->buf[1], out + 1, count / 2, 1);
+    return blip_read_samples(b->buf[1], out + 1, count / 2, 1) * 2;
 }
 
 int blip_apply_volume_to_sample(blip_wrap_t* b, int sample, float volume)
 {
+#ifdef __NDS__
+    // disable floats on ds as they're emulated, aka, slow!
+    // these shifts are equivelent to the below mult and divide
+    return (sample << 15) >> 10;
+    // return (((sample << 15) - sample) >> 10) + sample;
+    // return sample * INT16_MAX / VOLUME_MAX;
+#else
     return sample * b->volume / VOLUME_MAX * volume;
+#endif
 }
 
 void blip_wrap_set_volume(blip_wrap_t* b, float volume)

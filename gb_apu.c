@@ -1,8 +1,118 @@
 #include "gb_apu.h"
+#include "blip_wrap.h"
+
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stddef.h>
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+    #include <math.h>
+#endif
+
+#define FIFO_CAPACITY 8U /* ensure this is unsigned! */
+
+struct GbApuFrameSequencer
+{
+    uint8_t index;
+    uint8_t _padding[3];
+};
+
+struct GbApuLen
+{
+    uint16_t counter;
+};
+
+struct GbApuEnvelope
+{
+    uint8_t volume;
+    uint8_t timer;
+    bool disable;
+    uint8_t _padding[1];
+};
+
+struct GbApuSweep
+{
+    uint16_t freq_shadow_register;
+    uint8_t timer;
+    bool enabled;
+    bool did_negate;
+    uint8_t _padding[3];
+};
+
+struct GbApuSquare
+{
+    uint8_t duty_index;
+};
+
+struct GbApuWave
+{
+    uint8_t sample_buffer;
+    uint8_t position_counter;
+    bool just_accessed;
+    uint8_t _padding[1];
+};
+
+struct GbApuNoise
+{
+    uint16_t lfsr;
+};
+
+// implimentation taken from this issue: https://github.com/mgba-emu/mgba/issues/1847
+struct GbApuFifo
+{
+    uint32_t ring_buf[FIFO_CAPACITY];
+    uint16_t r_index;
+    uint16_t w_index;
+
+    // this is a 32-bit word taken from buf[r_index] on pop()
+    // the 8-bit sample output is taken from the lower 8-bits,
+    // then, that sample is shifted out.
+    // if the fifo and playing buffer are empty, then the current
+    // sample is played over, the playing buffer isn't looped as samples
+    // are shifted out.
+    uint32_t playing_buffer;
+    uint16_t playing_buffer_index;
+
+    // the output sample, taken from the lower 8-bits of playing_buffer.
+    int8_t current_sample;
+    uint8_t _padding[1];
+};
+
+struct GbApuChannel
+{
+    uint32_t clock; /* clock used for blip_buf. */
+    uint32_t timestamp; /* timestamp since last tick(). */
+    int32_t amp[2]; /* last volume output left/right. */
+    int32_t frequency_timer; /* freq that's counted down every tick. */
+};
+
+struct GbApu
+{
+    /* for savestates, back up everything here. */
+    struct GbApuChannel channels[6];
+    struct GbApuLen len[4]; /* every psg channel has one. */
+    struct GbApuEnvelope env[4]; /* all psg channels bar wave. */
+    struct GbApuSweep sweep;
+    struct GbApuSquare square[2];
+    struct GbApuWave wave;
+    struct GbApuNoise noise;
+    struct GbApuFifo fifo[2];
+    struct GbApuFrameSequencer frame_sequencer;
+    uint16_t agb_soundcnt;
+    uint16_t agb_soundbias;
+    uint8_t io[0x50]; /* 0x30 + AGB wave ram (0x20). */
+    /* end. */
+
+    blip_wrap_t* blip;
+    float channel_volume[6];
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+    int capacitor_charge_factor; /*  */
+    int capacitor[2]; /* left and right capacitors */
+#endif
+    enum GbApuType type;
+};
 
 // APU (square1)
 #define REG_NR10 apu->io[0x10]
@@ -31,31 +141,70 @@
 #define REG_NR50 apu->io[0x24]
 #define REG_NR51 apu->io[0x25]
 #define REG_NR52 apu->io[0x26]
+// APU (agb)
+#define REG_SOUNDCNT_H apu->agb_soundcnt
+#define REG_SOUNDBIAS apu->agb_soundbias
+
+#define apu_min(x, y) (x) < (y) ? (x) : (y)
+#define apu_max(x, y) (x) > (y) ? (x) : (y)
+#define apu_clamp(a, x, y) apu_max(apu_min(a, y), x)
+#define apu_array_size(a) (sizeof(a) / sizeof(a[0]))
+
+enum { CAPACITOR_SCALE = 15 };
+
+static const double CHARGE_FACTOR[3] = {
+    [GbApuFilter_NONE] = 1.0,
+    [GbApuFilter_DMG] = 0.999958,
+    [GbApuFilter_CGB] = 0.998943,
+};
+
+static const uint8_t SQUARE_DUTY_CYCLES[3][4][8] = {
+    [GbApuType_DMG] = {
+        { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
+        { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
+        { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
+        { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
+    },
+    [GbApuType_CGB] = {
+        { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
+        { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
+        { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
+        { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
+    },
+    [GbApuType_AGB] = {
+        { 1, 1, 1, 1, 1, 1, 1, 0, }, // 87.5%
+        { 0, 1, 1, 1, 1, 1, 1, 0, }, // 75%
+        { 0, 1, 1, 1, 1, 0, 0, 0, }, // 50%
+        { 1, 0, 0, 0, 0, 0, 0, 1, }, // 25%
+    },
+};
+
+// multiply then shift down, eg 75% vol is ((v * 3) / 4)
+static const uint8_t WAVE_VOLUME_MULTIPLYER[8] = {
+    0, // 0%
+    4, // 100%
+    2, // 50%
+    1, // 25%
+    3, // 75%
+};
+
+static const uint8_t NOISE_DIVISOR[8] = {
+    8, 16, 32, 48, 64, 80, 96, 112
+};
+
+static const uint8_t AGB_PSG_SHIFT_TABLE[4] = {
+    2, // 25%
+    1, // 50%
+    0, // 100%
+};
 
 enum ChannelType {
     ChannelType_SQUARE0,
     ChannelType_SQUARE1,
     ChannelType_WAVE,
     ChannelType_NOISE,
-};
-
-// NOTE: this table is inverted on agb, make adjustments as needed.
-static const uint8_t SQUARE_DUTY_CYCLES[4][8] = {
-    { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
-    { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
-    { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
-    { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
-};
-
-static const uint8_t WAVE_VOLUME_DIVIDER[4] = {
-    4, // 0%
-    0, // 100%
-    1, // 50%
-    2, // 25%
-};
-
-static const uint8_t NOISE_DIVISOR[8] = {
-    8, 16, 32, 48, 64, 80, 96, 112
+    ChannelType_FIFOA,
+    ChannelType_FIFOB,
 };
 
 static const uint8_t SQAURE_DUTY_ADDR[2] = {
@@ -117,8 +266,61 @@ static const uint8_t IO_CHANNEL_NUM[0x40] = {
     [0x23] = NRx4 | ChannelType_NOISE,
 };
 
-// reads return the register or'd with this table
-static const uint8_t IO_READ_VALUE[0x40] = {
+// this is used to reduce the size of the table below.
+enum { AGB_ADDR_OFFSET = 0x60 };
+// this is used for 16 writes.
+enum { AGB_UNUSED_ADDR = 0x27 };
+
+// translates agb addr to dmg addr.
+static const uint8_t AGB_ADDR_TRANSLATION[64] = {
+    [0x60 - AGB_ADDR_OFFSET] = 0x10, // IO_SOUND1CNT_L
+    [0x61 - AGB_ADDR_OFFSET] = AGB_UNUSED_ADDR,
+    [0x62 - AGB_ADDR_OFFSET] = 0x11, // IO_SOUND1CNT_H
+    [0x63 - AGB_ADDR_OFFSET] = 0x12, // IO_SOUND1CNT_H
+    [0x64 - AGB_ADDR_OFFSET] = 0x13, // IO_SOUND1CNT_X
+    [0x65 - AGB_ADDR_OFFSET] = 0x14, // IO_SOUND1CNT_X
+
+    [0x68 - AGB_ADDR_OFFSET] = 0x16, // IO_SOUND2CNT_L
+    [0x69 - AGB_ADDR_OFFSET] = 0x17, // IO_SOUND2CNT_L
+    [0x6C - AGB_ADDR_OFFSET] = 0x18, // IO_SOUND2CNT_H
+    [0x6D - AGB_ADDR_OFFSET] = 0x19, // IO_SOUND2CNT_H
+
+    [0x70 - AGB_ADDR_OFFSET] = 0x1A, // IO_SOUND3CNT_L
+    [0x71 - AGB_ADDR_OFFSET] = AGB_UNUSED_ADDR,
+    [0x72 - AGB_ADDR_OFFSET] = 0x1B, // IO_SOUND3CNT_H
+    [0x73 - AGB_ADDR_OFFSET] = 0x1C, // IO_SOUND3CNT_H
+    [0x74 - AGB_ADDR_OFFSET] = 0x1D, // IO_SOUND3CNT_X
+    [0x75 - AGB_ADDR_OFFSET] = 0x1E, // IO_SOUND3CNT_X
+
+    [0x78 - AGB_ADDR_OFFSET] = 0x20, // IO_SOUND4CNT_L
+    [0x79 - AGB_ADDR_OFFSET] = 0x21, // IO_SOUND4CNT_L
+    [0x7C - AGB_ADDR_OFFSET] = 0x22, // IO_SOUND4CNT_H
+    [0x7D - AGB_ADDR_OFFSET] = 0x23, // IO_SOUND4CNT_H
+
+    [0x80 - AGB_ADDR_OFFSET] = 0x24, // IO_SOUNDCNT_L
+    [0x81 - AGB_ADDR_OFFSET] = 0x25, // IO_SOUNDCNT_L
+    [0x84 - AGB_ADDR_OFFSET] = 0x26, // IO_SOUNDCNT_X
+    [0x85 - AGB_ADDR_OFFSET] = AGB_UNUSED_ADDR,
+
+    [0x90 - AGB_ADDR_OFFSET] = 0x30, // IO_WAVE_RAM0_L
+    [0x91 - AGB_ADDR_OFFSET] = 0x31, // IO_WAVE_RAM0_L
+    [0x92 - AGB_ADDR_OFFSET] = 0x32, // IO_WAVE_RAM0_H
+    [0x93 - AGB_ADDR_OFFSET] = 0x33, // IO_WAVE_RAM0_H
+    [0x94 - AGB_ADDR_OFFSET] = 0x34, // IO_WAVE_RAM1_L
+    [0x95 - AGB_ADDR_OFFSET] = 0x35, // IO_WAVE_RAM1_L
+    [0x96 - AGB_ADDR_OFFSET] = 0x36, // IO_WAVE_RAM1_H
+    [0x97 - AGB_ADDR_OFFSET] = 0x37, // IO_WAVE_RAM1_H
+    [0x98 - AGB_ADDR_OFFSET] = 0x38, // IO_WAVE_RAM2_L
+    [0x99 - AGB_ADDR_OFFSET] = 0x39, // IO_WAVE_RAM2_L
+    [0x9A - AGB_ADDR_OFFSET] = 0x3A, // IO_WAVE_RAM2_H
+    [0x9B - AGB_ADDR_OFFSET] = 0x3B, // IO_WAVE_RAM2_H
+    [0x9C - AGB_ADDR_OFFSET] = 0x3C, // IO_WAVE_RAM3_L
+    [0x9D - AGB_ADDR_OFFSET] = 0x3D, // IO_WAVE_RAM3_L
+    [0x9E - AGB_ADDR_OFFSET] = 0x3E, // IO_WAVE_RAM3_H
+    [0x9F - AGB_ADDR_OFFSET] = 0x3F, // IO_WAVE_RAM3_H
+};
+
+static const uint8_t IO_READ_VALUE_DMG_CGB[0x40] = {
     [0x10] = 0x80, // NR10
     [0x11] = 0x3F, // NR11
     [0x12] = 0x00, // NR12
@@ -135,7 +337,6 @@ static const uint8_t IO_READ_VALUE[0x40] = {
     [0x1D] = 0xFF, // NR33
     [0x1E] = 0xBF, // NR34
     [0x1F] = 0xFF,
-
     [0x20] = 0xFF, // NR41
     [0x21] = 0x00, // NR42
     [0x22] = 0x00, // NR43
@@ -152,28 +353,42 @@ static const uint8_t IO_READ_VALUE[0x40] = {
     [0x2D] = 0xFF,
     [0x2E] = 0xFF,
     [0x2F] = 0xFF,
+};
 
-    // this can be read back as 0xFF or the actual value
-    [0x30] = 0x00, // WAVE RAM
-    [0x31] = 0x00, // WAVE RAM
-    [0x32] = 0x00, // WAVE RAM
-    [0x33] = 0x00, // WAVE RAM
-    [0x34] = 0x00, // WAVE RAM
-    [0x35] = 0x00, // WAVE RAM
-    [0x36] = 0x00, // WAVE RAM
-    [0x37] = 0x00, // WAVE RAM
-    [0x38] = 0x00, // WAVE RAM
-    [0x39] = 0x00, // WAVE RAM
-    [0x3A] = 0x00, // WAVE RAM
-    [0x3B] = 0x00, // WAVE RAM
-    [0x3C] = 0x00, // WAVE RAM
-    [0x3D] = 0x00, // WAVE RAM
-    [0x3E] = 0x00, // WAVE RAM
-    [0x3F] = 0x00, // WAVE RAM
+static const uint8_t IO_READ_VALUE_AGB[0x40] = {
+    [0x10] = 0x80, // NR10
+    [0x11] = 0x3F, // NR11
+    [0x12] = 0x00, // NR12
+    [0x13] = 0xFF, // NR13
+    [0x14] = 0xBF, // NR14
+    [0x16] = 0x3F, // NR21
+    [0x17] = 0x00, // NR22
+    [0x18] = 0xFF, // NR23
+    [0x19] = 0xBF, // NR24
+    [0x1A] = 0x1F, // NR30
+    [0x1B] = 0xFF, // NR31
+    [0x1C] = 0x1F, // NR32
+    [0x1D] = 0xFF, // NR33
+    [0x1E] = 0xBF, // NR34
+    [0x20] = 0xFF, // NR41
+    [0x21] = 0x00, // NR42
+    [0x22] = 0x00, // NR43
+    [0x23] = 0xBF, // NR44
+    [0x24] = 0x88, // NR50
+    [0x25] = 0x00, // NR51
+    [0x26] = 0x70, // NR52
+    [AGB_UNUSED_ADDR] = 0xFF, // see: AGB_UNUSED_ADDR
+};
+
+// reads return the register or'd with this table (agb is masked).
+static const uint8_t* IO_READ_VALUE[3] = {
+    [GbApuType_DMG] = IO_READ_VALUE_DMG_CGB,
+    [GbApuType_CGB] = IO_READ_VALUE_DMG_CGB,
+    [GbApuType_AGB] = IO_READ_VALUE_AGB,
 };
 
 // initial values of wave ram when powered on.
-static const uint8_t WAVE_RAM_INITIAL[2][0x10] = {
+static const uint8_t WAVE_RAM_INITIAL[3][0x10] = {
     [GbApuType_DMG] = {
         0x84, 0x40, 0x43, 0xAA, 0x2D, 0x78, 0x92, 0x3C,
         0x60, 0x59, 0x59, 0xB0, 0x34, 0xB8, 0x2E, 0xDA,
@@ -182,40 +397,49 @@ static const uint8_t WAVE_RAM_INITIAL[2][0x10] = {
         0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
         0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
     },
+    [GbApuType_AGB] = {
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+    },
 };
 
-static inline bool apu_is_dmg(const struct GbApu* apu)
+static inline bool apu_is_dmg(const GbApu* apu)
 {
     return apu->type == GbApuType_DMG;
 }
 
-static inline bool apu_is_cgb(const struct GbApu* apu)
+static inline bool apu_is_cgb(const GbApu* apu)
 {
-    return !apu_is_dmg(apu);
+    return apu->type == GbApuType_CGB || apu->type == GbApuType_AGB;
 }
 
-static inline bool apu_is_enabled(const struct GbApu* apu)
+static inline bool apu_is_agb(const GbApu* apu)
+{
+    return apu->type == GbApuType_AGB;
+}
+
+static inline bool apu_is_enabled(const GbApu* apu)
 {
     return REG_NR52 & 0x80;
 }
 
-static inline void channel_enable(struct GbApu* apu, unsigned num)
+static inline void channel_enable(GbApu* apu, unsigned num)
 {
     REG_NR52 |= 1 << num;
 }
 
-static inline void channel_disable(struct GbApu* apu, unsigned num)
+static inline void channel_disable(GbApu* apu, unsigned num)
 {
     REG_NR52 &= ~(1 << num);
     apu->channels[num].frequency_timer = 0;
 }
 
-static inline bool channel_is_enabled(const struct GbApu* apu, unsigned num)
+static inline bool channel_is_enabled(const GbApu* apu, unsigned num)
 {
     return REG_NR52 & (1 << num);
 }
 
-static inline bool channel_is_dac_enabled(const struct GbApu* apu, unsigned num)
+static inline bool channel_is_dac_enabled(const GbApu* apu, unsigned num)
 {
     // wave channel has it's own dac
     if (num == ChannelType_WAVE)
@@ -229,32 +453,34 @@ static inline bool channel_is_dac_enabled(const struct GbApu* apu, unsigned num)
     }
 }
 
-static unsigned channel_get_frequency(const struct GbApu* apu, unsigned num)
+static unsigned channel_get_frequency(const GbApu* apu, unsigned num)
 {
+    const unsigned m = apu_is_agb(apu) ? 4 : 1;
+
     if (num == ChannelType_SQUARE0)
     {
         const unsigned freq = ((REG_NR14 & 7) << 8) | REG_NR13;
-        return (2048 - freq) * 4;
+        return (2048 - freq) * 4 * m;
     }
     else if (num == ChannelType_SQUARE1)
     {
         const unsigned freq = ((REG_NR24 & 7) << 8) | REG_NR23;
-        return (2048 - freq) * 4;
+        return (2048 - freq) * 4 * m;
     }
     else if (num == ChannelType_WAVE)
     {
         const unsigned freq = ((REG_NR34 & 7) << 8) | REG_NR33;
-        return (2048 - freq) * 2;
+        return (2048 - freq) * 2 * m;
     }
     else // if (num == ChannelType_NOISE)
     {
         const unsigned divisor_code = REG_NR43 & 0x7;
         const unsigned clock_shift = REG_NR43 >> 4;
-        return NOISE_DIVISOR[divisor_code] << clock_shift;
+        return (NOISE_DIVISOR[divisor_code] << clock_shift) * m;
     }
 }
 
-static inline void add_delta(struct GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
+static inline void add_delta(GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
 {
     const int delta = sample - c->amp[lr];
     if (delta) // same as (sample != amp)
@@ -264,7 +490,7 @@ static inline void add_delta(struct GbApu* apu, struct GbApuChannel* c, unsigned
     }
 }
 
-static inline void add_delta_fast(struct GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
+static inline void add_delta_fast(GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
 {
     const int delta = sample - c->amp[lr];
     if (delta) // same as (sample != amp)
@@ -274,7 +500,7 @@ static inline void add_delta_fast(struct GbApu* apu, struct GbApuChannel* c, uns
     }
 }
 
-static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
+static void channel_sync_psg(GbApu* apu, unsigned num, unsigned time)
 {
     struct GbApuChannel* c = &apu->channels[num];
 
@@ -283,7 +509,7 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
     // i am not 100% sure how this works, but trust me, it works
     unsigned from = base_clock + c->frequency_timer;
     // get new timestamp
-    const unsigned new_timestamp = time - late;
+    const unsigned new_timestamp = time;
     // calculate how many cycles have elapsed since last sync
     const int until = new_timestamp - c->timestamp;
     // advance forward
@@ -316,10 +542,12 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
         return;
     }
 
+    const bool is_agb = apu_is_agb(apu);
     const bool left_enabled = REG_NR51 & (1 << (num + 0));
     const bool right_enabled = REG_NR51 & (1 << (num + 4));
     const int left_volume = left_enabled * (1 + ((REG_NR50 >> 0) & 0x7));
     const int right_volume = right_enabled * (1 + ((REG_NR50 >> 4) & 0x7));
+    const unsigned psg_shift = is_agb ? AGB_PSG_SHIFT_TABLE[REG_SOUNDCNT_H & 0x3] : 0;
 
     const unsigned freq = channel_get_frequency(apu, num);
     const float volume = apu->channel_volume[num];
@@ -333,18 +561,18 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
         const int envelope = apu->env[num].volume;
 
         const unsigned duty = apu->io[SQAURE_DUTY_ADDR[num]] >> 6;
-        unsigned duty_bit = SQUARE_DUTY_CYCLES[duty][square->duty_index];
+        unsigned duty_bit = SQUARE_DUTY_CYCLES[apu->type][duty][square->duty_index];
         const int sign_flipflop = duty_bit ? +1 : -1;
 
-        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop, volume);
-        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop, volume);
+        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop >> psg_shift, volume);
+        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop >> psg_shift, volume);
         add_delta(apu, c, from, left, 0);
         add_delta(apu, c, from, right, 1);
 
         while (c->frequency_timer <= 0)
         {
             square->duty_index = (square->duty_index + 1) % 8;
-            const unsigned new_duty_bit = SQUARE_DUTY_CYCLES[duty][square->duty_index];
+            const unsigned new_duty_bit = SQUARE_DUTY_CYCLES[apu->type][duty][square->duty_index];
             if (new_duty_bit != duty_bit)
             {
                 duty_bit = new_duty_bit;
@@ -362,28 +590,34 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
     {
         struct GbApuWave* wave = &apu->wave;
 
-        const bool will_tick = c->frequency_timer <= 0;
-        const unsigned volume_divider = WAVE_VOLUME_DIVIDER[(REG_NR32 >> 5) & 0x3];
+        const int invert = is_agb ? 0xF : 0x0;
+        const bool bank_mode = is_agb ? (REG_NR30 & 0x20) : 0;
+        const bool bank_select = is_agb ? (REG_NR30 & 0x40) : 1;
+        const unsigned bank_mask = bank_mode ? 64 : 32;
+        const unsigned bank_offset = (bank_mode == 0 && bank_select) ? 0 : 16;
+
+        const int wave_mult = WAVE_VOLUME_MULTIPLYER[(REG_NR32 >> 5) & (is_agb ? 0x7 : 0x3)];
         int sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
-        sample = (sample * 2 - 15) >> volume_divider; // [-15,+15]
+        sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15] inverted
 
         int left = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
         int right = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
         add_delta_fast(apu, c, from, left, 0);
         add_delta_fast(apu, c, from, right, 1);
 
+        const bool will_tick = c->frequency_timer <= 0;
         while (c->frequency_timer <= 0)
         {
-            wave->position_counter = (wave->position_counter + 1) % 32;
+            wave->position_counter = (wave->position_counter + 1) % bank_mask;
 
             // fetch new sample if we are done with this buffer
             if (!(wave->position_counter & 0x1))
             {
-                wave->sample_buffer = REG_WAVE_TABLE[wave->position_counter >> 1];
+                wave->sample_buffer = REG_WAVE_TABLE[bank_offset + (wave->position_counter >> 1)];
             }
 
             sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
-            sample = (sample * 2 - 15) >> volume_divider; // [-15,+15]
+            sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15] inverted
 
             int left = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
             int right = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
@@ -395,7 +629,7 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
         }
 
         // if ticked, and timer==freq, that means it was accessed on this very cycle
-        wave->just_accessed = will_tick && c->frequency_timer == freq;
+        wave->just_accessed = will_tick && (unsigned)c->frequency_timer == freq;
     }
     else if (num == ChannelType_NOISE)
     {
@@ -405,8 +639,8 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
         unsigned bit0 = noise->lfsr & 0x1;
         const int sign_flipflop = bit0 ? -1 : +1; // inverted
 
-        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop, volume);
-        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop, volume);
+        int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop >> psg_shift, volume);
+        int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop >> psg_shift, volume);
         add_delta_fast(apu, c, from, left, 0);
         add_delta_fast(apu, c, from, right, 1);
 
@@ -444,29 +678,80 @@ static void channel_sync(struct GbApu* apu, unsigned num, unsigned time, unsigne
     }
 }
 
-static void channel_sync_all(struct GbApu* apu, unsigned time, unsigned late)
+static void channel_sync_fifo(GbApu* apu, unsigned num, unsigned time)
 {
-    channel_sync(apu, ChannelType_SQUARE0, time, late);
-    channel_sync(apu, ChannelType_SQUARE1, time, late);
-    channel_sync(apu, ChannelType_WAVE, time, late);
-    channel_sync(apu, ChannelType_NOISE, time, late);
+    struct GbApuChannel* c = &apu->channels[num];
+
+    // get starting point
+    const unsigned base_clock = c->clock;
+    // i am not 100% sure how this works, but trust me, it works
+    unsigned from = base_clock + c->frequency_timer;
+    // get new timestamp
+    const unsigned new_timestamp = time;
+    // calculate how many cycles have elapsed since last sync
+    const int until = new_timestamp - c->timestamp;
+    // advance forward
+    c->clock += until;
+    // save new timestamp
+    c->timestamp = new_timestamp;
+
+    // always advance the clock above
+    if (!apu_is_agb(apu))
+    {
+        return;
+    }
+
+    if (!apu_is_enabled(apu))
+    {
+        add_delta(apu, c, from, 0, 0);
+        add_delta(apu, c, from, 0, 1);
+        return;
+    }
+
+    const unsigned reg = REG_SOUNDCNT_H;
+    const bool volume_code = num == ChannelType_FIFOA ? (reg & 0x4) : (reg & 0x8);
+    const bool enable_right = num == ChannelType_FIFOA ? (reg & 0x100) : (reg & 0x1000);
+    const bool enable_left = num == ChannelType_FIFOA ? (reg & 0x200) : (reg & 0x2000);
+
+    const struct GbApuFifo* fifo = &apu->fifo[num - ChannelType_FIFOA];
+
+    const int sample = fifo->current_sample * (volume_code ? 4 : 2);
+    const int left = blip_apply_volume_to_sample(apu->blip, sample * enable_left, apu->channel_volume[num]);
+    const int right = blip_apply_volume_to_sample(apu->blip, sample * enable_right, apu->channel_volume[num]);
+
+    add_delta(apu, c, from, left, 0);
+    add_delta(apu, c, from, right, 1);
+}
+
+static void channel_sync_psg_all(GbApu* apu, unsigned time)
+{
+    channel_sync_psg(apu, ChannelType_SQUARE0, time);
+    channel_sync_psg(apu, ChannelType_SQUARE1, time);
+    channel_sync_psg(apu, ChannelType_WAVE, time);
+    channel_sync_psg(apu, ChannelType_NOISE, time);
+}
+
+static void channel_sync_fifo_all(GbApu* apu, unsigned time)
+{
+    channel_sync_fifo(apu, ChannelType_FIFOA, time);
+    channel_sync_fifo(apu, ChannelType_FIFOB, time);
 }
 
 // this is used when a channel is triggered
-static bool is_next_frame_sequencer_step_not_len(const struct GbApu* apu)
+static bool is_next_frame_sequencer_step_not_len(const GbApu* apu)
 {
     // check if the current counter is the len clock, the next one won't be!
     return apu->frame_sequencer.index & 0x1;
 }
 
 // this is used when channels 1,2,4 are triggered
-static bool is_next_frame_sequencer_step_vol(const struct GbApu* apu)
+static bool is_next_frame_sequencer_step_vol(const GbApu* apu)
 {
     // check if the current counter is the len clock, the next one won't be!
     return apu->frame_sequencer.index == 7;
 }
 
-static unsigned sweep_get_new_freq(struct GbApu* apu)
+static unsigned sweep_get_new_freq(GbApu* apu)
 {
     const unsigned shift = REG_NR10 & 0x7;
     const unsigned negate = (REG_NR10 >> 3) & 0x1;
@@ -483,7 +768,7 @@ static unsigned sweep_get_new_freq(struct GbApu* apu)
     }
 }
 
-static void sweep_do_freq_calc(struct GbApu* apu, bool update_value)
+static void sweep_do_freq_calc(GbApu* apu, bool update_value)
 {
     const unsigned new_freq = sweep_get_new_freq(apu);
     const unsigned shift = REG_NR10 & 0x7;
@@ -500,7 +785,7 @@ static void sweep_do_freq_calc(struct GbApu* apu, bool update_value)
     }
 }
 
-static void sweep_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
+static void sweep_clock(GbApu* apu, unsigned num, unsigned time)
 {
     struct GbApuSweep* sweep = &apu->sweep;
 
@@ -517,7 +802,7 @@ static void sweep_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned
             // sweep is only clocked if period is not 0
             if (period != 0)
             {
-                channel_sync(apu, num, time, late);
+                channel_sync_psg(apu, num, time);
                 // first time updates the value
                 sweep_do_freq_calc(apu, true);
                 // second time does not, but still checks for overflow
@@ -527,7 +812,7 @@ static void sweep_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned
     }
 }
 
-static void sweep_trigger(struct GbApu* apu)
+static void sweep_trigger(GbApu* apu)
 {
     apu->sweep.did_negate = false;
 
@@ -549,12 +834,12 @@ static void sweep_trigger(struct GbApu* apu)
     }
 }
 
-static bool len_is_enabled(const struct GbApu* apu, unsigned num)
+static bool len_is_enabled(const GbApu* apu, unsigned num)
 {
     return apu->io[LEN_REG_ADDR[num]] & 0x40;
 }
 
-static void len_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
+static void len_clock(GbApu* apu, unsigned num, unsigned time)
 {
     struct GbApuLen* len = &apu->len[num];
 
@@ -564,13 +849,13 @@ static void len_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned l
         len->counter--;
         if (len->counter == 0)
         {
-            channel_sync(apu, num, time, late);
+            channel_sync_psg(apu, num, time);
             channel_disable(apu, num);
         }
     }
 }
 
-static void len_on_nrx4_edge_case_write(struct GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
+static void len_on_nrx4_edge_case_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
 {
     struct GbApuLen* len = &apu->len[num];
 
@@ -590,7 +875,7 @@ static void len_on_nrx4_edge_case_write(struct GbApu* apu, unsigned num, unsigne
     }
 }
 
-static void len_trigger(struct GbApu* apu, unsigned num)
+static void len_trigger(GbApu* apu, unsigned num)
 {
     struct GbApuLen* len = &apu->len[num];
 
@@ -604,7 +889,7 @@ static void len_trigger(struct GbApu* apu, unsigned num)
     }
 }
 
-static void env_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned late)
+static void env_clock(GbApu* apu, unsigned num, unsigned time)
 {
     struct GbApuEnvelope* env = &apu->env[num];
 
@@ -625,7 +910,7 @@ static void env_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned l
 
                 if (new_volume <= 15)
                 {
-                    channel_sync(apu, num, time, late);
+                    channel_sync_psg(apu, num, time);
                     env->volume = new_volume;
                 }
                 else
@@ -637,9 +922,8 @@ static void env_clock(struct GbApu* apu, unsigned num, unsigned time, unsigned l
     }
 }
 
-static void env_trigger(struct GbApu* apu, unsigned num)
+static void env_trigger(GbApu* apu, unsigned num)
 {
-    // struct GbApuEnvelope* env = &apu->channels[num].env;
     struct GbApuEnvelope* env = &apu->env[num];
 
     const unsigned reg = apu->io[ENV_REG_ADDR[num]];
@@ -658,10 +942,11 @@ static void env_trigger(struct GbApu* apu, unsigned num)
     env->volume = starting_vol;
 }
 
-static void env_write(struct GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
+static void env_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
 {
 #if defined(GB_APU_ZOMBIE) && GB_APU_ZOMBIE
-    if (channel_is_enabled(apu, num))
+    // zombie mode works differently on agb, disable it for now.
+    if (!apu_is_agb(apu) && channel_is_enabled(apu, num))
     {
         // NOTE: the below "zombie mode" isn't accurate for each revision.
         // This causes ticks in zelda as it triggers zombie 2 repeatedly.
@@ -695,7 +980,7 @@ static void env_write(struct GbApu* apu, unsigned num, unsigned new_value, unsig
     }
 }
 
-static void trigger(struct GbApu* apu, unsigned num, unsigned time)
+static void trigger(GbApu* apu, unsigned num, unsigned time)
 {
     struct GbApuChannel* c = &apu->channels[num];
     const unsigned new_freq = channel_get_frequency(apu, num);
@@ -724,7 +1009,7 @@ static void trigger(struct GbApu* apu, unsigned num, unsigned time)
         }
 
         // https://forums.nesdev.org/viewtopic.php?t=13730
-        c->frequency_timer = new_freq + 6;
+        c->frequency_timer = new_freq + 6 * (apu_is_agb(apu) ? 4 : 1);
         apu->wave.position_counter = 0;
     }
     else
@@ -759,7 +1044,7 @@ static void trigger(struct GbApu* apu, unsigned num, unsigned time)
     }
 }
 
-static void on_nrx0_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
+static void on_nrx0_write(GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
 {
     if (num == ChannelType_SQUARE0)
     {
@@ -782,15 +1067,14 @@ static void on_nrx0_write(struct GbApu* apu, unsigned num, unsigned time, unsign
     }
 }
 
-static void on_nrx1_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
+static void on_nrx1_write(GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
 {
     const unsigned reload_value = LEN_RELOAD_VALUE[num];
     const unsigned mask = reload_value - 1;
-    // apu->channels[num].len.counter = reload_value - (new_value & mask);
     apu->len[num].counter = reload_value - (new_value & mask);
 }
 
-static void on_nrx2_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
+static void on_nrx2_write(GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
 {
     if (num != ChannelType_WAVE)
     {
@@ -798,12 +1082,12 @@ static void on_nrx2_write(struct GbApu* apu, unsigned num, unsigned time, unsign
     }
 }
 
-static void on_nrx3_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
+static void on_nrx3_write(GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
 {
     // nothing special happens here...
 }
 
-static void on_nrx4_write(struct GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
+static void on_nrx4_write(GbApu* apu, unsigned num, unsigned time, unsigned new_value, unsigned old_value)
 {
     len_on_nrx4_edge_case_write(apu, num, new_value, old_value);
 
@@ -813,52 +1097,97 @@ static void on_nrx4_write(struct GbApu* apu, unsigned num, unsigned time, unsign
     }
 }
 
-static void frame_sequencer_clock_len(struct GbApu* apu, unsigned time, unsigned late)
+static void frame_sequencer_clock_len(GbApu* apu, unsigned time)
 {
-    len_clock(apu, ChannelType_SQUARE0, time, late);
-    len_clock(apu, ChannelType_SQUARE1, time, late);
-    len_clock(apu, ChannelType_WAVE, time, late);
-    len_clock(apu, ChannelType_NOISE, time, late);
+    len_clock(apu, ChannelType_SQUARE0, time);
+    len_clock(apu, ChannelType_SQUARE1, time);
+    len_clock(apu, ChannelType_WAVE, time);
+    len_clock(apu, ChannelType_NOISE, time);
 }
 
-static void frame_sequencer_clock_sweep(struct GbApu* apu, unsigned time, unsigned late)
+static void frame_sequencer_clock_sweep(GbApu* apu, unsigned time)
 {
-    sweep_clock(apu, ChannelType_SQUARE0, time, late);
+    sweep_clock(apu, ChannelType_SQUARE0, time);
 }
 
-static void frame_sequencer_clock_env(struct GbApu* apu, unsigned time, unsigned late)
+static void frame_sequencer_clock_env(GbApu* apu, unsigned time)
 {
-    env_clock(apu, ChannelType_SQUARE0, time, late);
-    env_clock(apu, ChannelType_SQUARE1, time, late);
-    env_clock(apu, ChannelType_NOISE, time, late);
+    env_clock(apu, ChannelType_SQUARE0, time);
+    env_clock(apu, ChannelType_SQUARE1, time);
+    env_clock(apu, ChannelType_NOISE, time);
 }
+
+static unsigned fifo_get_size(const struct GbApuFifo* fifo)
+{
+    return (fifo->w_index - fifo->r_index) % FIFO_CAPACITY;
+}
+
+static void fifo_reset(struct GbApuFifo* fifo)
+{
+    fifo->r_index = fifo->w_index = 0;
+}
+
+static struct GbApuFifo* fifo_from_addr(GbApu* apu, unsigned addr)
+{
+    return &apu->fifo[(addr & 0x4) == 0x4];
+}
+
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+static inline int high_pass(int charge_factor, int in, int* capacitor)
+{
+    in <<= CAPACITOR_SCALE;
+    const int out = (in - *capacitor) >> CAPACITOR_SCALE;
+    *capacitor = (in - out * charge_factor);
+    return apu_clamp(out, INT16_MIN, INT16_MAX);
+}
+#endif
 
 /* ------------------PUBLIC API------------------ */
-void apu_init(struct GbApu* apu, double clock_rate, double sample_rate)
+GbApu* apu_init(double clock_rate, double sample_rate)
 {
-    assert(clock_rate > 0.0 && sample_rate > 0.0);
-    memset(apu, 0, sizeof(*apu));
+    GbApu* apu = calloc(1, sizeof(*apu));
+    if (!apu)
+    {
+        goto fail;
+    }
 
-    for (int i = 0; i < 4; i++)
+    for (unsigned i = 0; i < apu_array_size(apu->channel_volume); i++)
     {
         apu->channel_volume[i] = 1.0;
     }
 
-    apu->blip = blip_wrap_new(sample_rate);
-    blip_wrap_set_rates(apu->blip, clock_rate, sample_rate);
-    blip_wrap_set_volume(apu->blip, 0.5);
+    if (!(apu->blip = blip_wrap_new(sample_rate))) {
+        goto fail;
+    }
+
+    if (blip_wrap_set_rates(apu->blip, clock_rate, sample_rate)) {
+        goto fail;
+    }
+
+    apu_set_master_volume(apu, 0.25);
+    apu_set_highpass_filter(apu, GbApuFilter_NONE, clock_rate, sample_rate);
+
+    return apu;
+
+fail:
+    apu_quit(apu);
+    return NULL;
 }
 
-void apu_quit(struct GbApu* apu)
+void apu_quit(GbApu* apu)
 {
-    if (apu->blip)
+    if (apu)
     {
-        blip_wrap_delete(apu->blip);
-        apu->blip = NULL;
+        if (apu->blip)
+        {
+            blip_wrap_delete(apu->blip);
+            apu->blip = NULL;
+        }
+        free(apu);
     }
 }
 
-void apu_reset(struct GbApu* apu, enum GbApuType type)
+void apu_reset(GbApu* apu, enum GbApuType type)
 {
     apu_clear_samples(apu);
     apu->type = type;
@@ -867,75 +1196,62 @@ void apu_reset(struct GbApu* apu, enum GbApuType type)
     memset(&apu->square, 0, sizeof(apu->square));
     memset(&apu->wave, 0, sizeof(apu->wave));
     memset(&apu->noise, 0, sizeof(apu->noise));
+    memset(&apu->fifo, 0, sizeof(apu->fifo));
     memset(&apu->frame_sequencer, 0, sizeof(apu->frame_sequencer));
+    apu->agb_soundcnt = 0;
+    apu->agb_soundbias = 0;
     memset(apu->io + 0x10, 0, 0x17);
-    memcpy(REG_WAVE_TABLE, WAVE_RAM_INITIAL[type], 0x10);
+    memcpy(REG_WAVE_TABLE, WAVE_RAM_INITIAL[type], sizeof(WAVE_RAM_INITIAL[type]));
     apu->noise.lfsr = 0x7FFF;
 }
 
-unsigned apu_read_io(struct GbApu* apu, unsigned addr, unsigned time)
+void apu_update_timestamp(GbApu* apu, int time)
 {
-    assert((addr & 0xFF) >= 0x10 && (addr & 0xFF) <= 0x7F);
-    addr &= 0x7F;
-
-    if (addr >= 0x30 && addr <= 0x3F && channel_is_enabled(apu, ChannelType_WAVE))
+    for (unsigned i = 0; i < apu_array_size(apu->channels); i++)
     {
-        channel_sync(apu, ChannelType_WAVE, time, 0);
-        if (apu_is_cgb(apu) || apu->wave.just_accessed)
+        apu->channels[i].timestamp += time;
+    }
+}
+
+unsigned apu_read_io(GbApu* apu, unsigned addr, unsigned time)
+{
+    assert((addr & 0xFF) >= 0x10 && (addr & 0xFF) <= 0x3F);
+    addr &= 0x3F;
+
+    if (addr >= 0x30 && addr <= 0x3F)
+    {
+        const bool bank_mode = REG_NR30 & 0x20;
+        if (apu_is_agb(apu) && !bank_mode)
         {
-            return REG_WAVE_TABLE[apu->wave.position_counter >> 1];
+            // writes happen to the opposite bank.
+            const bool bank_select = REG_NR30 & 0x40;
+            const unsigned offset = (bank_select ^ 1) ? 0 : 16;
+            return apu->io[addr + offset];
         }
         else
         {
-            return 0xFF; // writes to dmg are ignored if wave wasn't just accessed
+            if (channel_is_enabled(apu, ChannelType_WAVE))
+            {
+                channel_sync_psg(apu, ChannelType_WAVE, time);
+                if (apu_is_cgb(apu) || apu->wave.just_accessed)
+                {
+                    return REG_WAVE_TABLE[apu->wave.position_counter >> 1];
+                }
+                else
+                {
+                    return 0xFF; // writes to dmg are ignored if wave wasn't just accessed.
+                }
+            }
         }
     }
-    else if (addr == 0x76) // PCM12
-    {
-        unsigned value = 0xFF;
-        if (apu_is_cgb(apu))
-        {
-            channel_sync(apu, ChannelType_SQUARE0, time, 0);
-            channel_sync(apu, ChannelType_SQUARE1, time, 0);
 
-            const bool square0_enabled = channel_is_enabled(apu, ChannelType_SQUARE0);
-            const bool square1_enabled = channel_is_enabled(apu, ChannelType_SQUARE1);
-            const bool square0_duty = SQUARE_DUTY_CYCLES[apu->io[SQAURE_DUTY_ADDR[0]] >> 6][apu->square[0].duty_index];
-            const bool square1_duty = SQUARE_DUTY_CYCLES[apu->io[SQAURE_DUTY_ADDR[1]] >> 6][apu->square[1].duty_index];
-            const unsigned square0_sample = apu->env[ChannelType_SQUARE0].volume;
-            const unsigned square1_sample = apu->env[ChannelType_SQUARE1].volume;
-
-            value = square0_duty * square0_sample * square0_enabled * apu_is_enabled(apu) << 0;
-            value |= square1_duty * square1_sample * square1_enabled * apu_is_enabled(apu) << 4;
-        }
-        return value;
-    }
-    else if (addr == 0x77) // PCM34
-    {
-        unsigned value = 0xFF;
-        if (apu_is_cgb(apu))
-        {
-            channel_sync(apu, ChannelType_WAVE, time, 0);
-            channel_sync(apu, ChannelType_NOISE, time, 0);
-
-            const bool wave_enabled = channel_is_enabled(apu, ChannelType_WAVE);
-            const bool noise_enabled = channel_is_enabled(apu, ChannelType_NOISE);
-            const unsigned wave_sample = (apu->wave.position_counter & 0x1) ? apu->wave.sample_buffer & 0xF : apu->wave.sample_buffer >> 4;
-            const unsigned noise_sample = !(apu->noise.lfsr & 1) * apu->env[ChannelType_NOISE].volume;
-
-            value = wave_sample * wave_enabled * apu_is_enabled(apu) << 0;
-            value |= noise_sample * noise_enabled * apu_is_enabled(apu) << 4;
-        }
-        return value;
-    }
-
-    return apu->io[addr] | IO_READ_VALUE[addr];
+    return apu->io[addr] | IO_READ_VALUE[apu->type][addr];
 }
 
-void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned time)
+void apu_write_io(GbApu* apu, unsigned addr, unsigned value, unsigned time)
 {
-    assert((addr & 0xFF) >= 0x10 && (addr & 0xFF) <= 0x7F);
-    addr &= 0x7F;
+    assert((addr & 0xFF) >= 0x10 && (addr & 0xFF) <= 0x3F);
+    addr &= 0x3F;
 
     // nr52 is always writeable
     if (addr == 0x26) // nr52
@@ -943,7 +1259,7 @@ void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned tim
         // check if it's now disabled
         if (apu_is_enabled(apu) && !(value & 0x80))
         {
-            channel_sync_all(apu, time, 0);
+            channel_sync_psg_all(apu, time);
 
             // len counters are unaffected on the dmg
             const unsigned nr11 = REG_NR11 & 0x3F;
@@ -982,18 +1298,29 @@ void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned tim
     // wave ram is always accessable
     else if (addr >= 0x30 && addr <= 0x3F) // wave ram
     {
-        // if enabled, writes are ignored on dmg, allowed on cgb.
-        if (channel_is_enabled(apu, ChannelType_WAVE))
+        const bool bank_mode = REG_NR30 & 0x20;
+        if (apu_is_agb(apu) && !bank_mode)
         {
-            channel_sync(apu, ChannelType_WAVE, time, 0);
-            if (apu_is_cgb(apu) || apu->wave.just_accessed)
-            {
-                REG_WAVE_TABLE[apu->wave.position_counter >> 1] = value;
-            }
+            // writes happen to the opposite bank.
+            const bool bank_select = REG_NR30 & 0x40;
+            const unsigned offset = (bank_select ^ 1) ? 0 : 16;
+            apu->io[addr + offset] = value;
         }
         else
         {
-            apu->io[addr] = value;
+            // if enabled, writes are ignored on dmg, allowed on cgb.
+            if (channel_is_enabled(apu, ChannelType_WAVE))
+            {
+                channel_sync_psg(apu, ChannelType_WAVE, time);
+                if (apu_is_cgb(apu) || apu->wave.just_accessed)
+                {
+                    REG_WAVE_TABLE[apu->wave.position_counter >> 1] = value;
+                }
+            }
+            else
+            {
+                apu->io[addr] = value;
+            }
         }
     }
     // writes to the apu are ignore whilst disabled
@@ -1013,30 +1340,33 @@ void apu_write_io(struct GbApu* apu, unsigned addr, unsigned value, unsigned tim
     }
     else if (addr == 0x24 || addr == 0x25) // nr50 | nr51
     {
-        channel_sync_all(apu, time, 0);
+        channel_sync_psg_all(apu, time);
         apu->io[addr] = value;
     }
     else
     {
         const unsigned num = IO_CHANNEL_NUM[addr] & 0x3;
-        channel_sync(apu, num, time, 0);
-
         const unsigned nrxx = IO_CHANNEL_NUM[addr] & ~0x3;
-        const unsigned old_value = apu->io[addr];
-        apu->io[addr] = value;
-
-        switch (nrxx)
+        if (nrxx)
         {
-            case NRx0: on_nrx0_write(apu, num, time, value, old_value); break;
-            case NRx1: on_nrx1_write(apu, num, time, value, old_value); break;
-            case NRx2: on_nrx2_write(apu, num, time, value, old_value); break;
-            case NRx3: on_nrx3_write(apu, num, time, value, old_value); break;
-            case NRx4: on_nrx4_write(apu, num, time, value, old_value); break;
+            channel_sync_psg(apu, num, time);
+
+            const unsigned old_value = apu->io[addr];
+            apu->io[addr] = value;
+
+            switch (nrxx)
+            {
+                case NRx0: on_nrx0_write(apu, num, time, value, old_value); break;
+                case NRx1: on_nrx1_write(apu, num, time, value, old_value); break;
+                case NRx2: on_nrx2_write(apu, num, time, value, old_value); break;
+                case NRx3: on_nrx3_write(apu, num, time, value, old_value); break;
+                case NRx4: on_nrx4_write(apu, num, time, value, old_value); break;
+            }
         }
     }
 }
 
-void apu_frame_sequencer_clock(struct GbApu* apu, unsigned time, unsigned late)
+void apu_frame_sequencer_clock(GbApu* apu, unsigned time)
 {
     if (!apu_is_enabled(apu))
     {
@@ -1047,62 +1377,266 @@ void apu_frame_sequencer_clock(struct GbApu* apu, unsigned time, unsigned late)
     {
         case 0: // len
         case 4:
-            frame_sequencer_clock_len(apu, time, late);
+            frame_sequencer_clock_len(apu, time);
             break;
 
         case 2: // len, sweep
         case 6:
-            frame_sequencer_clock_len(apu, time, late);
-            frame_sequencer_clock_sweep(apu, time, late);
+            frame_sequencer_clock_len(apu, time);
+            frame_sequencer_clock_sweep(apu, time);
             break;
 
         case 7: // vol
-            frame_sequencer_clock_env(apu, time, late);
+            frame_sequencer_clock_env(apu, time);
             break;
     }
 
     apu->frame_sequencer.index = (apu->frame_sequencer.index + 1) % 8;
 }
 
-void apu_set_channel_volume(struct GbApu* apu, unsigned channel_num, float volume)
+unsigned apu_cgb_read_pcm12(GbApu* apu, unsigned time)
 {
-    // clip range 0.0 - 1.0
-    volume = volume < 0.0F ? 0.0F : volume > 1.0F ? 1.0F : volume;
-    apu->channel_volume[channel_num] = volume;
+    assert(apu_is_cgb(apu) && "invalid access");
+    channel_sync_psg(apu, ChannelType_SQUARE0, time);
+    channel_sync_psg(apu, ChannelType_SQUARE1, time);
+
+    const bool square0_enabled = channel_is_enabled(apu, ChannelType_SQUARE0);
+    const bool square1_enabled = channel_is_enabled(apu, ChannelType_SQUARE1);
+
+    const bool square0_duty = SQUARE_DUTY_CYCLES[apu->type][apu->io[SQAURE_DUTY_ADDR[0]] >> 6][apu->square[0].duty_index];
+    const bool square1_duty = SQUARE_DUTY_CYCLES[apu->type][apu->io[SQAURE_DUTY_ADDR[1]] >> 6][apu->square[1].duty_index];
+    const unsigned square0_sample = apu->env[ChannelType_SQUARE0].volume;
+    const unsigned square1_sample = apu->env[ChannelType_SQUARE1].volume;
+
+    unsigned value = square0_duty * square0_sample * square0_enabled * apu_is_enabled(apu) << 0;
+    value |= square1_duty * square1_sample * square1_enabled * apu_is_enabled(apu) << 4;
+
+    return value;
 }
 
-void apu_set_master_volume(struct GbApu* apu, float volume)
+unsigned apu_cgb_read_pcm34(GbApu* apu, unsigned time)
 {
-    // clip range 0.0 - 1.0
-    volume = volume < 0.0F ? 0.0F : volume > 1.0F ? 1.0F : volume;
-    blip_wrap_set_volume(apu->blip, volume);
+    assert(apu_is_cgb(apu) && "invalid access");
+    channel_sync_psg(apu, ChannelType_WAVE, time);
+    channel_sync_psg(apu, ChannelType_NOISE, time);
+
+    const bool wave_enabled = channel_is_enabled(apu, ChannelType_WAVE);
+    const bool noise_enabled = channel_is_enabled(apu, ChannelType_NOISE);
+    const unsigned wave_sample = (apu->wave.position_counter & 0x1) ? apu->wave.sample_buffer & 0xF : apu->wave.sample_buffer >> 4;
+    const unsigned noise_sample = !(apu->noise.lfsr & 1) * apu->env[ChannelType_NOISE].volume;
+
+    unsigned value = wave_sample * wave_enabled * apu_is_enabled(apu) << 0;
+    value |= noise_sample * noise_enabled * apu_is_enabled(apu) << 4;
+
+    return value;
 }
 
-void apu_set_bass(struct GbApu* apu, int frequency)
+unsigned apu_agb_read8_io(GbApu* apu, unsigned addr, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    addr = AGB_ADDR_TRANSLATION[(addr & 0xFF) - AGB_ADDR_OFFSET];
+    return apu_read_io(apu, addr, time) & ~IO_READ_VALUE_AGB[addr];
+}
+
+void apu_agb_write8_io(GbApu* apu, unsigned addr, unsigned value, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    addr = AGB_ADDR_TRANSLATION[(addr & 0xFF) - AGB_ADDR_OFFSET];
+    apu_write_io(apu, addr, value, time);
+}
+
+unsigned apu_agb_read16_io(GbApu* apu, unsigned addr, unsigned time)
+{
+    unsigned v = apu_agb_read8_io(apu, addr + 0, time) << 0;
+    v |= apu_agb_read8_io(apu, addr + 1, time) << 8;
+    return v;
+}
+
+void apu_agb_write16_io(GbApu* apu, unsigned addr, unsigned value, unsigned time)
+{
+    apu_agb_write8_io(apu, addr + 0, value >> 0, time);
+    apu_agb_write8_io(apu, addr + 1, value >> 8, time);
+}
+
+unsigned apu_agb_soundcnt_read(GbApu* apu, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    return REG_SOUNDCNT_H & 0x770F;
+}
+
+void apu_agb_soundcnt_write(GbApu* apu, unsigned value, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    channel_sync_psg_all(apu, time);
+    channel_sync_fifo_all(apu, time);
+
+    if (value & 0x800)
+    {
+        fifo_reset(&apu->fifo[0]);
+    }
+    if (value & 0x8000)
+    {
+        fifo_reset(&apu->fifo[1]);
+    }
+
+    REG_SOUNDCNT_H = value;
+}
+
+unsigned apu_agb_soundbias_read(GbApu* apu, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    return REG_SOUNDBIAS & 0xC3FF;
+}
+
+void apu_agb_soundbias_write(GbApu* apu, unsigned value, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    REG_SOUNDBIAS = value;
+}
+
+// 8-bit writes use the previous 3 samples in the buffer
+void apu_agb_fifo_write8(GbApu* apu, unsigned addr, unsigned value)
+{
+    const struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
+    const unsigned bit_shift = (addr & 0x3) * 8;
+    const unsigned buf_word = fifo->ring_buf[fifo->w_index];
+    const unsigned result = (buf_word & ~(0xFF << bit_shift)) | (value << bit_shift);
+    apu_agb_fifo_write32(apu, addr, result);
+}
+
+// 16-bit writes use the previous 1 sample in the buffer
+void apu_agb_fifo_write16(GbApu* apu, unsigned addr, unsigned value)
+{
+    const struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
+    const unsigned bit_shift = (addr & 0x2) * 8;
+    const unsigned buf_word = fifo->ring_buf[fifo->w_index];
+    const unsigned result = (buf_word & ~(0xFFFF << bit_shift)) | (value << bit_shift);
+    apu_agb_fifo_write32(apu, addr, result);
+}
+
+void apu_agb_fifo_write32(GbApu* apu, unsigned addr, unsigned value)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
+    fifo->ring_buf[fifo->w_index] = value;
+    fifo->w_index = (fifo->w_index + 1) % FIFO_CAPACITY; // advance write pointer
+}
+
+void apu_agb_timer_overflow(GbApu* apu, void* user, apu_agb_fifo_dma_request dma_callback, unsigned timer_num, unsigned time)
+{
+    assert(apu_is_agb(apu) && "invalid access");
+    const unsigned reg = REG_SOUNDCNT_H;
+
+    for (unsigned i = 0; i < apu_array_size(apu->fifo); i++)
+    {
+        struct GbApuFifo* fifo = &apu->fifo[i];
+        const bool timer_select = i == 0 ? (reg & 0x400) : (reg & 0x4000);
+        if (timer_select == timer_num)
+        {
+            /* request dma if there are 4 or more empty words. */
+            if (FIFO_CAPACITY - fifo_get_size(fifo) > 4)
+            {
+                dma_callback(user, i, time);
+            }
+
+            // if playing buffer is empty and we have a at least a 32-bit word in the fifo, reload it.
+            if (!fifo->playing_buffer_index && fifo_get_size(fifo))
+            {
+                fifo->playing_buffer_index = 4; // 32-bits, 4 samples
+                fifo->playing_buffer = fifo->ring_buf[fifo->r_index]; // load 32-bits, 4 samples
+                fifo->r_index = (fifo->r_index + 1) % FIFO_CAPACITY; // advance read pointer
+            }
+
+            // if playing buffer isn't empty, reload new sample and shift out the old one.
+            if (fifo->playing_buffer_index)
+            {
+                channel_sync_fifo(apu, ChannelType_FIFOA + i, time);
+                fifo->current_sample = fifo->playing_buffer; // load 8-bits
+                fifo->playing_buffer >>= 8; // shift out sample
+                fifo->playing_buffer_index--; // reduce buffer size
+            }
+        }
+    }
+}
+
+unsigned apu_read_io_raw(const GbApu* apu, unsigned addr)
+{
+    assert((addr & 0xFF) >= 0x10 && (addr & 0xFF) <= 0x3F);
+    return apu->io[addr & 0x3F];
+}
+
+unsigned apu_agb_read_io_raw(const GbApu* apu, unsigned addr)
+{
+    addr = AGB_ADDR_TRANSLATION[(addr & 0xFF) - AGB_ADDR_OFFSET];
+    return apu_read_io_raw(apu, addr);
+}
+
+unsigned apu_agb_soundcnt_read_raw(const GbApu* apu)
+{
+    return REG_SOUNDCNT_H;
+}
+
+unsigned apu_agb_soundbias_read_raw(const GbApu* apu)
+{
+    return REG_SOUNDBIAS;
+}
+
+void apu_set_highpass_filter(GbApu* apu, enum GbApuFilter filter, double clock_rate, double sample_rate)
+{
+    apu_set_highpass_filter_custom(apu, CHARGE_FACTOR[filter], clock_rate, sample_rate);
+}
+
+void apu_set_highpass_filter_custom(GbApu* apu, double charge_factor, double clock_rate, double sample_rate)
+{
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+    const double capacitor_charge = pow(apu_clamp(charge_factor, 0.0, 1.0), clock_rate / sample_rate);
+    const double fixed_point_scale = 1 << CAPACITOR_SCALE;
+    apu->capacitor_charge_factor = round(capacitor_charge * fixed_point_scale);
+    memset(apu->capacitor, 0, sizeof(apu->capacitor));
+#endif
+}
+
+void apu_set_channel_volume(GbApu* apu, unsigned channel_num, float volume)
+{
+    apu->channel_volume[channel_num] = apu_clamp(volume, 0.0F, 1.0F);
+}
+
+void apu_set_master_volume(GbApu* apu, float volume)
+{
+    blip_wrap_set_volume(apu->blip, apu_clamp(volume, 0.0F, 1.0F));
+}
+
+void apu_set_bass(GbApu* apu, int frequency)
 {
     blip_wrap_set_bass(apu->blip, frequency);
 }
 
-void apu_set_treble(struct GbApu* apu, double treble_db)
+void apu_set_treble(GbApu* apu, double treble_db)
 {
     blip_wrap_set_treble(apu->blip, treble_db);
 }
 
-int apu_clear_clocks_needed(struct GbApu* apu, int sample_count)
+int apu_clocks_needed(const GbApu* apu, int sample_count)
 {
     return blip_wrap_clocks_needed(apu->blip, sample_count);
 }
 
-void apu_end_frame(struct GbApu* apu, unsigned time, unsigned late)
+int apu_samples_avaliable(const GbApu* apu)
+{
+    return blip_wrap_samples_avail(apu->blip);
+}
+
+void apu_end_frame(GbApu* apu, unsigned time)
 {
     // catchup all the channels to the same point.
-    channel_sync_all(apu, time, late);
+    channel_sync_psg_all(apu, time);
+    channel_sync_fifo_all(apu, time);
 
     // clocks of all channels will be the same as they're synced above.
     const unsigned clock_duration = apu->channels[0].clock;
 
     // reset clocks.
-    for (int i = 0; i < 4; i++)
+    for (unsigned i = 0; i < apu_array_size(apu->channels); i++)
     {
         assert(clock_duration == apu->channels[i].clock);
         apu->channels[i].clock = 0;
@@ -1112,17 +1646,72 @@ void apu_end_frame(struct GbApu* apu, unsigned time, unsigned late)
     blip_wrap_end_frame(apu->blip, clock_duration);
 }
 
-int apu_samples_avaliable(const struct GbApu* apu)
+int apu_read_samples(GbApu* apu, short out[], int count)
 {
-    return blip_wrap_samples_avail(apu->blip);
+    count = blip_wrap_read_samples(apu->blip, out, count);
+
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+    if (apu->capacitor_charge_factor != CAPACITOR_SCALE) /* only apply if enabled. */
+    {
+        for (int i = 0; i < count; i += 2)
+        {
+            out[i + 0] = high_pass(apu->capacitor_charge_factor, out[i + 0], &apu->capacitor[0]);
+            out[i + 1] = high_pass(apu->capacitor_charge_factor, out[i + 1], &apu->capacitor[1]);
+        }
+    }
+#endif
+
+    return count;
 }
 
-int apu_read_samples(struct GbApu* apu, short out[], int count)
-{
-    return blip_wrap_read_samples(apu->blip, out, count);
-}
-
-void apu_clear_samples(struct GbApu* apu)
+void apu_clear_samples(GbApu* apu)
 {
     blip_wrap_clear(apu->blip);
+}
+
+#if (defined(__cplusplus) && __cplusplus < 201103L) || (!defined(static_assert))
+  #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    #define static_assert _Static_assert
+  #else
+    #define static_assert(expr, msg) typedef char static_assertion[(expr) ? 1 : -1]
+  #endif
+#endif
+
+static_assert(offsetof(GbApu, channels) == 0, "bad channels offset, save states broken!");
+static_assert(offsetof(GbApu, len) == 120, "bad len offset, save states broken!");
+static_assert(offsetof(GbApu, env) == 128, "bad env offset, save states broken!");
+static_assert(offsetof(GbApu, sweep) == 144, "bad sweep offset, save states broken!");
+static_assert(offsetof(GbApu, square) == 152, "bad square offset, save states broken!");
+static_assert(offsetof(GbApu, wave) == 154, "bad wave offset, save states broken!");
+static_assert(offsetof(GbApu, noise) == 158, "bad noise offset, save states broken!");
+static_assert(offsetof(GbApu, fifo) == 160, "bad fifo offset, save states broken!");
+static_assert(offsetof(GbApu, frame_sequencer) == 248, "bad frame_sequencer offset, save states broken!");
+static_assert(offsetof(GbApu, agb_soundcnt) == 252, "bad agb_soundcnt offset, save states broken!");
+static_assert(offsetof(GbApu, agb_soundbias) == 254, "bad agb_soundbias offset, save states broken!");
+static_assert(offsetof(GbApu, io) == 256, "bad io offset, save states broken!");
+static_assert(offsetof(GbApu, blip) == 336, "bad blip offset, save states broken!");
+
+unsigned apu_state_size(void)
+{
+    return offsetof(GbApu, blip);
+}
+
+int apu_save_state(const GbApu* apu, void* data, unsigned size)
+{
+    if (!data || size < apu_state_size())
+    {
+        return 1;
+    }
+
+    return !memcpy(data, apu, apu_state_size());
+}
+
+int apu_load_state(GbApu* apu, const void* data, unsigned size)
+{
+    if (!data || size < apu_state_size())
+    {
+        return 1;
+    }
+
+    return !memcpy(apu, data, apu_state_size());
 }

@@ -1,16 +1,16 @@
 # gb_apu
 
-implementation of the Gameboy apu in ~1k lines of code.
+implementation of the Gameboy / Gameboy Advance apu in ~2k lines of code.
 
 this uses blip_buf internally to resample the psg channels to your desired output rate.
 
 when using this library, you have the choice between using blip_buf or Blip_buffer, the latter being c++.
 
-using the latter will allow you to have bass and treble control, as well as sounding slightly better sounds slightly better. Other than that, both function the same and the api remains the same, and the exposed api doesn't change.
+using the latter will allow you to have bass and treble control, as well as sounding slightly better. Other than that, both function the same and the exposed api doesn't change.
 
-The `C` version compiles down to ~25 KiB in release mode.
+The `C` version compiles down to ~40 KiB in release mode.
 
-The `CXX` version compiles down to ~34 KiB in release mode.
+The `CXX` version compiles down to ~71 KiB in release mode.
 
 ---
 
@@ -61,7 +61,7 @@ include(FetchContent)
 
 FetchContent_Declare(gb_apu
     GIT_REPOSITORY https://github.com/ITotalJustice/gb_apu.git
-    GIT_TAG        v1.2.0
+    GIT_TAG        v1.3.0
 )
 
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
