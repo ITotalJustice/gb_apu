@@ -1,69 +1,69 @@
 #include "gb_apu.h"
-#include "blip_wrap.h"
+#include "blargg/blip_wrap.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <stddef.h>
 #if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
     #include <math.h>
 #endif
 
 #define FIFO_CAPACITY 8U /* ensure this is unsigned! */
 
-struct GbApuFrameSequencer
+typedef struct GbApuFrameSequencer
 {
     uint8_t index;
     uint8_t _padding[3];
-};
+} GbApuFrameSequencer;
 
-struct GbApuLen
+typedef struct GbApuLen
 {
     uint16_t counter;
-};
+} GbApuLen;
 
-struct GbApuEnvelope
+typedef struct GbApuEnvelope
 {
     uint8_t volume;
     uint8_t timer;
     bool disable;
     uint8_t _padding[1];
-};
+} GbApuEnvelope;
 
-struct GbApuSweep
+typedef struct GbApuSweep
 {
     uint16_t freq_shadow_register;
     uint8_t timer;
     bool enabled;
     bool did_negate;
     uint8_t _padding[3];
-};
+} GbApuSweep;
 
-struct GbApuSquare
+typedef struct GbApuSquare
 {
     uint8_t duty_index;
-};
+} GbApuSquare;
 
-struct GbApuWave
+typedef struct GbApuWave
 {
-    uint8_t sample_buffer;
     uint8_t position_counter;
+    uint8_t sample_buffer;
     bool just_accessed;
     uint8_t _padding[1];
-};
+} GbApuWave;
 
-struct GbApuNoise
+typedef struct GbApuNoise
 {
     uint16_t lfsr;
-};
+} GbApuNoise;
 
 // implimentation taken from this issue: https://github.com/mgba-emu/mgba/issues/1847
-struct GbApuFifo
+typedef struct GbApuFifo
 {
     uint32_t ring_buf[FIFO_CAPACITY];
-    uint16_t r_index;
+    uint16_t r_index; /* u16 for padding. */
     uint16_t w_index;
 
     // this is a 32-bit word taken from buf[r_index] on pop()
@@ -78,15 +78,15 @@ struct GbApuFifo
     // the output sample, taken from the lower 8-bits of playing_buffer.
     int8_t current_sample;
     uint8_t _padding[1];
-};
+} GbApuFifo;
 
-struct GbApuChannel
+typedef struct GbApuChannel
 {
     uint32_t clock; /* clock used for blip_buf. */
     uint32_t timestamp; /* timestamp since last tick(). */
+    uint32_t frequency_timer; /* freq that's counted down every tick. */
     int32_t amp[2]; /* last volume output left/right. */
-    int32_t frequency_timer; /* freq that's counted down every tick. */
-};
+} GbApuChannel;
 
 struct GbApu
 {
@@ -112,6 +112,7 @@ struct GbApu
     int capacitor[2]; /* left and right capacitors */
 #endif
     enum GbApuType type;
+    bool zombie_mode_enable;
 };
 
 // APU (square1)
@@ -158,29 +159,15 @@ static const double CHARGE_FACTOR[3] = {
     [GbApuFilter_CGB] = 0.998943,
 };
 
-static const uint8_t SQUARE_DUTY_CYCLES[3][4][8] = {
-    [GbApuType_DMG] = {
-        { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
-        { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
-        { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
-        { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
-    },
-    [GbApuType_CGB] = {
-        { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
-        { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
-        { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
-        { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
-    },
-    [GbApuType_AGB] = {
-        { 1, 1, 1, 1, 1, 1, 1, 0, }, // 87.5%
-        { 0, 1, 1, 1, 1, 1, 1, 0, }, // 75%
-        { 0, 1, 1, 1, 1, 0, 0, 0, }, // 50%
-        { 1, 0, 0, 0, 0, 0, 0, 1, }, // 25%
-    },
+static const bool SQUARE_DUTY_CYCLES[4][8] = {
+    { 0, 0, 0, 0, 0, 0, 0, 1 }, // 12.5%
+    { 1, 0, 0, 0, 0, 0, 0, 1 }, // 25%
+    { 1, 0, 0, 0, 0, 1, 1, 1 }, // 50%
+    { 0, 1, 1, 1, 1, 1, 1, 0 }, // 75%
 };
 
 // multiply then shift down, eg 75% vol is ((v * 3) / 4)
-static const uint8_t WAVE_VOLUME_MULTIPLYER[8] = {
+static const uint8_t WAVE_VOLUME_MULTIPLIER[8] = {
     0, // 0%
     4, // 100%
     2, // 50%
@@ -388,6 +375,7 @@ static const uint8_t* IO_READ_VALUE[3] = {
 };
 
 // initial values of wave ram when powered on.
+// todo: verify as agb has twice the bank size.
 static const uint8_t WAVE_RAM_INITIAL[3][0x10] = {
     [GbApuType_DMG] = {
         0x84, 0x40, 0x43, 0xAA, 0x2D, 0x78, 0x92, 0x3C,
@@ -480,7 +468,7 @@ static unsigned channel_get_frequency(const GbApu* apu, unsigned num)
     }
 }
 
-static inline void add_delta(GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
+static inline void add_delta(GbApu* apu, GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
 {
     const int delta = sample - c->amp[lr];
     if (delta) // same as (sample != amp)
@@ -490,7 +478,7 @@ static inline void add_delta(GbApu* apu, struct GbApuChannel* c, unsigned clock_
     }
 }
 
-static inline void add_delta_fast(GbApu* apu, struct GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
+static inline void add_delta_fast(GbApu* apu, GbApuChannel* c, unsigned clock_time, int sample, unsigned lr)
 {
     const int delta = sample - c->amp[lr];
     if (delta) // same as (sample != amp)
@@ -500,30 +488,78 @@ static inline void add_delta_fast(GbApu* apu, struct GbApuChannel* c, unsigned c
     }
 }
 
+static inline void clock_square(GbApuSquare* square, unsigned count)
+{
+    square->duty_index = (square->duty_index + count) % 8;
+}
+
+static inline void clock_wave(GbApu* apu, GbApuWave* wave, bool is_agb)
+{
+    // samples are played from the bank selected on agb.
+    const bool bank_select = REG_NR30 & 0x40;
+    unsigned bank_offset = (is_agb && bank_select) ? 16 : 0;
+
+    // counter is advanced before playing a sample.
+    wave->position_counter++;
+    if (wave->position_counter == 32)
+    {
+        // reset position.
+        wave->position_counter = 0;
+
+        // swap banks if in single bank mode.
+        const bool bank_mode = REG_NR30 & 0x20;
+        if (is_agb && bank_mode)
+        {
+            REG_NR30 ^= 0x40;
+            bank_offset ^= 16;
+        }
+    }
+
+    // fetch new sample if we are done with this buffer
+    if (!(wave->position_counter & 0x1))
+    {
+        wave->sample_buffer = REG_WAVE_TABLE[bank_offset + (wave->position_counter >> 1)];
+    }
+}
+
+static inline void clock_noise(GbApuNoise* noise, unsigned bits)
+{
+    // result = bit1 != bit0
+    const bool result = (((noise->lfsr >> 1) ^ noise->lfsr) ^ 1) & 0x1;
+    // now we shift the lfsr BEFORE setting the value!
+    noise->lfsr >>= 1;
+    // unset bit-14 or bit-6 AND bit-14
+    noise->lfsr &= ~bits;
+    // set bit-14 or bit-6 AND bit-14
+    noise->lfsr |= bits * result;
+}
+
 static void channel_sync_psg(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuChannel* c = &apu->channels[num];
+    GbApuChannel* c = &apu->channels[num];
 
     // get starting point
     const unsigned base_clock = c->clock;
-    // i am not 100% sure how this works, but trust me, it works
+    // this is the time at which the sample is first generated.
     unsigned from = base_clock + c->frequency_timer;
     // get new timestamp
     const unsigned new_timestamp = time;
     // calculate how many cycles have elapsed since last sync
-    const int until = new_timestamp - c->timestamp;
+    const unsigned until = new_timestamp - c->timestamp;
     // advance forward
     c->clock += until;
     // save new timestamp
     c->timestamp = new_timestamp;
 
-    // already clocked on this cycle, or bad timestamp
-    if (until <= 0)
+    // already clocked on this cycle.
+    if (!until)
     {
         return;
     }
 
-    // clip clock range
+    // if the timer is greater than until, then the channel will not be ticked.
+    // a sample is still generated (as the volume / enable may have changed).
+    // so, the actual sample start (from) is updated to the end (until).
     if (c->frequency_timer > until)
     {
         from = base_clock + until;
@@ -547,132 +583,136 @@ static void channel_sync_psg(GbApu* apu, unsigned num, unsigned time)
     const bool right_enabled = REG_NR51 & (1 << (num + 4));
     const int left_volume = left_enabled * (1 + ((REG_NR50 >> 0) & 0x7));
     const int right_volume = right_enabled * (1 + ((REG_NR50 >> 4) & 0x7));
-    const unsigned psg_shift = is_agb ? AGB_PSG_SHIFT_TABLE[REG_SOUNDCNT_H & 0x3] : 0;
+    const int psg_shift = is_agb ? AGB_PSG_SHIFT_TABLE[REG_SOUNDCNT_H & 0x3] : 0;
 
     const unsigned freq = channel_get_frequency(apu, num);
     const float volume = apu->channel_volume[num];
 
-    c->frequency_timer -= until;
+    // adjust frequency_timer and calculate how many times to clock channel.
+    const int frequency_timer = (int)c->frequency_timer - (int)until;
+    int clock_count = frequency_timer <= 0 ? (1 + -frequency_timer / freq) : (0);
+    c->frequency_timer = frequency_timer + freq * clock_count;
 
-    // the below can be further optimised, should you need to.
+    // generate a sample for the selected channel.
     if (num == ChannelType_SQUARE0 || num == ChannelType_SQUARE1)
     {
-        struct GbApuSquare* square = &apu->square[num];
-        const int envelope = apu->env[num].volume;
-
+        GbApuSquare* square = &apu->square[num];
         const unsigned duty = apu->io[SQAURE_DUTY_ADDR[num]] >> 6;
-        unsigned duty_bit = SQUARE_DUTY_CYCLES[apu->type][duty][square->duty_index];
-        const int sign_flipflop = duty_bit ? +1 : -1;
+        bool duty_bit = SQUARE_DUTY_CYCLES[duty][square->duty_index];
+        int sign_flipflop = (duty_bit ^ is_agb) ? +1 : -1; // inverted on agb.
 
+        const int envelope = apu->env[num].volume;
         int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop >> psg_shift, volume);
         int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop >> psg_shift, volume);
         add_delta(apu, c, from, left, 0);
         add_delta(apu, c, from, right, 1);
 
-        while (c->frequency_timer <= 0)
+        if (clock_count)
         {
-            square->duty_index = (square->duty_index + 1) % 8;
-            const unsigned new_duty_bit = SQUARE_DUTY_CYCLES[apu->type][duty][square->duty_index];
-            if (new_duty_bit != duty_bit)
+            if (left || right)
             {
-                duty_bit = new_duty_bit;
-                left = -left;
-                right = -right;
-                add_delta(apu, c, from, left, 0);
-                add_delta(apu, c, from, right, 1);
+                do {
+                    clock_square(square, 1);
+                    const bool new_duty_bit = SQUARE_DUTY_CYCLES[duty][square->duty_index];
+                    if (duty_bit != new_duty_bit)
+                    {
+                        duty_bit = new_duty_bit;
+                        left = -left;
+                        right = -right;
+                        add_delta(apu, c, from, left, 0);
+                        add_delta(apu, c, from, right, 1);
+                    }
+                    from += freq;
+                } while (--clock_count);
             }
-
-            from += freq;
-            c->frequency_timer += freq;
+            else
+            {
+                clock_square(square, clock_count);
+            }
         }
     }
     else if (num == ChannelType_WAVE)
     {
-        struct GbApuWave* wave = &apu->wave;
-
-        const int invert = is_agb ? 0xF : 0x0;
-        const bool bank_mode = is_agb ? (REG_NR30 & 0x20) : 0;
-        const bool bank_select = is_agb ? (REG_NR30 & 0x40) : 1;
-        const unsigned bank_mask = bank_mode ? 64 : 32;
-        const unsigned bank_offset = (bank_mode == 0 && bank_select) ? 0 : 16;
-
-        const int wave_mult = WAVE_VOLUME_MULTIPLYER[(REG_NR32 >> 5) & (is_agb ? 0x7 : 0x3)];
+        GbApuWave* wave = &apu->wave;
+        const int invert = is_agb ? 0xF : 0x0; // inverted on agb.
+        const int wave_mult = WAVE_VOLUME_MULTIPLIER[(REG_NR32 >> 5) & (is_agb ? 0x7 : 0x3)];
         int sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
-        sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15] inverted
+        sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15]
 
         int left = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
-        int right = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
-        add_delta_fast(apu, c, from, left, 0);
-        add_delta_fast(apu, c, from, right, 1);
+        int right = blip_apply_volume_to_sample(apu->blip, sample * right_volume, volume);
+        add_delta(apu, c, from, left, 0);
+        add_delta(apu, c, from, right, 1);
 
-        const bool will_tick = c->frequency_timer <= 0;
-        while (c->frequency_timer <= 0)
+        if (clock_count)
         {
-            wave->position_counter = (wave->position_counter + 1) % bank_mask;
+            // if ticked, and timer==freq, that means it was accessed on this very cycle.
+            wave->just_accessed = clock_count && c->frequency_timer == freq;
 
-            // fetch new sample if we are done with this buffer
-            if (!(wave->position_counter & 0x1))
+            if ((left_volume || right_volume) && wave_mult)
             {
-                wave->sample_buffer = REG_WAVE_TABLE[bank_offset + (wave->position_counter >> 1)];
+                do {
+                    clock_wave(apu, wave, is_agb);
+                    sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
+                    sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15]
+
+                    int left = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
+                    int right = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
+                    add_delta(apu, c, from, left, 0);
+                    add_delta(apu, c, from, right, 1);
+                    from += freq;
+                } while (--clock_count);
             }
-
-            sample = (wave->position_counter & 0x1) ? wave->sample_buffer & 0xF : wave->sample_buffer >> 4;
-            sample = (((sample ^ invert) * 2 - 15) * wave_mult) >> 2; // [-15,+15] inverted
-
-            int left = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
-            int right = blip_apply_volume_to_sample(apu->blip, sample * left_volume, volume);
-            add_delta_fast(apu, c, from, left, 0);
-            add_delta_fast(apu, c, from, right, 1);
-
-            from += freq;
-            c->frequency_timer += freq;
+            else
+            {
+                do {
+                    clock_wave(apu, wave, is_agb);
+                } while (--clock_count);
+            }
         }
-
-        // if ticked, and timer==freq, that means it was accessed on this very cycle
-        wave->just_accessed = will_tick && (unsigned)c->frequency_timer == freq;
     }
     else if (num == ChannelType_NOISE)
     {
-        struct GbApuNoise* noise = &apu->noise;
+        GbApuNoise* noise = &apu->noise;
+        bool bit0 = noise->lfsr & 0x1;
+        const int sign_flipflop = (bit0 ^ is_agb) ? +1 : -1; // inverted on agb.
+
         const int envelope = apu->env[num].volume;
-
-        unsigned bit0 = noise->lfsr & 0x1;
-        const int sign_flipflop = bit0 ? -1 : +1; // inverted
-
         int left = blip_apply_volume_to_sample(apu->blip, envelope * left_volume * sign_flipflop >> psg_shift, volume);
         int right = blip_apply_volume_to_sample(apu->blip, envelope * right_volume * sign_flipflop >> psg_shift, volume);
         add_delta_fast(apu, c, from, left, 0);
         add_delta_fast(apu, c, from, right, 1);
 
-        // clock shift of 14/15 means noise recieves no clocks!
-        const unsigned clock_shift = REG_NR43 >> 4;
-        if (noise->lfsr && clock_shift < 14)
+        if (clock_count)
         {
-            const unsigned bits = (REG_NR43 & 0x8) ? 0x4040 : 0x4000;
-
-            while (c->frequency_timer <= 0)
+            // clock shift of 14/15 means noise recieves no clocks!
+            const unsigned clock_shift = REG_NR43 >> 4;
+            if (noise->lfsr != 0x7FFF && clock_shift < 14)
             {
-                const unsigned result = ((noise->lfsr >> 1) ^ noise->lfsr) & 0x1;
-                // now we shift the lfsr BEFORE setting the value!
-                noise->lfsr >>= 1;
-                // unset bit-14 or bit-6 AND bit-14
-                noise->lfsr &= ~bits;
-                // set bit-14 or bit-6 AND bit-14
-                noise->lfsr |= bits * result;
+                const unsigned bits = (REG_NR43 & 0x8) ? 0x4040 : 0x4000;
 
-                // get new bit0, see if it changed
-                const unsigned new_bit0 = noise->lfsr & 0x1;
-                if (new_bit0 != bit0)
+                if (left || right)
                 {
-                    bit0 = new_bit0;
-                    left = -left;
-                    right = -right;
-                    add_delta_fast(apu, c, from, left, 0);
-                    add_delta_fast(apu, c, from, right, 1);
+                    do {
+                        clock_noise(noise, bits);
+                        const bool new_bit0 = noise->lfsr & 0x1;
+                        if (bit0 != new_bit0)
+                        {
+                            bit0 = new_bit0;
+                            left = -left;
+                            right = -right;
+                            add_delta_fast(apu, c, from, left, 0);
+                            add_delta_fast(apu, c, from, right, 1);
+                        }
+                        from += freq;
+                    } while (--clock_count);
                 }
-
-                from += freq;
-                c->frequency_timer += freq;
+                else
+                {
+                    do {
+                        clock_noise(noise, bits);
+                    } while (--clock_count);
+                }
             }
         }
     }
@@ -680,22 +720,26 @@ static void channel_sync_psg(GbApu* apu, unsigned num, unsigned time)
 
 static void channel_sync_fifo(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuChannel* c = &apu->channels[num];
+    GbApuChannel* c = &apu->channels[num];
 
-    // get starting point
-    const unsigned base_clock = c->clock;
-    // i am not 100% sure how this works, but trust me, it works
-    unsigned from = base_clock + c->frequency_timer;
+    // this is the time at which the sample is first generated.
+    const unsigned from = c->clock;
     // get new timestamp
     const unsigned new_timestamp = time;
     // calculate how many cycles have elapsed since last sync
-    const int until = new_timestamp - c->timestamp;
+    const unsigned until = new_timestamp - c->timestamp;
     // advance forward
     c->clock += until;
     // save new timestamp
     c->timestamp = new_timestamp;
 
-    // always advance the clock above
+    // already clocked on this cycle.
+    if (!until)
+    {
+        return;
+    }
+
+    // always advance the clock above.
     if (!apu_is_agb(apu))
     {
         return;
@@ -713,8 +757,7 @@ static void channel_sync_fifo(GbApu* apu, unsigned num, unsigned time)
     const bool enable_right = num == ChannelType_FIFOA ? (reg & 0x100) : (reg & 0x1000);
     const bool enable_left = num == ChannelType_FIFOA ? (reg & 0x200) : (reg & 0x2000);
 
-    const struct GbApuFifo* fifo = &apu->fifo[num - ChannelType_FIFOA];
-
+    const GbApuFifo* fifo = &apu->fifo[num - ChannelType_FIFOA];
     const int sample = fifo->current_sample * (volume_code ? 4 : 2);
     const int left = blip_apply_volume_to_sample(apu->blip, sample * enable_left, apu->channel_volume[num]);
     const int right = blip_apply_volume_to_sample(apu->blip, sample * enable_right, apu->channel_volume[num]);
@@ -787,7 +830,7 @@ static void sweep_do_freq_calc(GbApu* apu, bool update_value)
 
 static void sweep_clock(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuSweep* sweep = &apu->sweep;
+    GbApuSweep* sweep = &apu->sweep;
 
     if (channel_is_enabled(apu, num) && sweep->enabled)
     {
@@ -841,7 +884,7 @@ static bool len_is_enabled(const GbApu* apu, unsigned num)
 
 static void len_clock(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuLen* len = &apu->len[num];
+    GbApuLen* len = &apu->len[num];
 
     // len is still clocked, even with the channel disabled.
     if (len_is_enabled(apu, num) && len->counter > 0)
@@ -857,7 +900,7 @@ static void len_clock(GbApu* apu, unsigned num, unsigned time)
 
 static void len_on_nrx4_edge_case_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
 {
-    struct GbApuLen* len = &apu->len[num];
+    GbApuLen* len = &apu->len[num];
 
     const unsigned old_enabled = old_value & 0x40;
     const unsigned new_enabled = new_value & 0x40;
@@ -877,7 +920,7 @@ static void len_on_nrx4_edge_case_write(GbApu* apu, unsigned num, unsigned new_v
 
 static void len_trigger(GbApu* apu, unsigned num)
 {
-    struct GbApuLen* len = &apu->len[num];
+    GbApuLen* len = &apu->len[num];
 
     if (len->counter == 0)
     {
@@ -891,7 +934,7 @@ static void len_trigger(GbApu* apu, unsigned num)
 
 static void env_clock(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuEnvelope* env = &apu->env[num];
+    GbApuEnvelope* env = &apu->env[num];
 
     if (channel_is_enabled(apu, num) && !env->disable)
     {
@@ -905,10 +948,10 @@ static void env_clock(GbApu* apu, unsigned num, unsigned time)
             if (period != 0)
             {
                 const unsigned mode = (reg >> 3) & 0x1;
-                const unsigned modifier = mode == 1 ? +1 : -1;
-                const unsigned new_volume = env->volume + modifier;
+                const int modifier = mode == 1 ? +1 : -1;
+                const int new_volume = env->volume + modifier;
 
-                if (new_volume <= 15)
+                if (new_volume >= 0 && new_volume <= 15)
                 {
                     channel_sync_psg(apu, num, time);
                     env->volume = new_volume;
@@ -924,7 +967,7 @@ static void env_clock(GbApu* apu, unsigned num, unsigned time)
 
 static void env_trigger(GbApu* apu, unsigned num)
 {
-    struct GbApuEnvelope* env = &apu->env[num];
+    GbApuEnvelope* env = &apu->env[num];
 
     const unsigned reg = apu->io[ENV_REG_ADDR[num]];
     const unsigned period = reg & 0x7;
@@ -944,14 +987,13 @@ static void env_trigger(GbApu* apu, unsigned num)
 
 static void env_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old_value)
 {
-#if defined(GB_APU_ZOMBIE) && GB_APU_ZOMBIE
     // zombie mode works differently on agb, disable it for now.
-    if (!apu_is_agb(apu) && channel_is_enabled(apu, num))
+    if (apu->zombie_mode_enable && !apu_is_agb(apu) && channel_is_enabled(apu, num))
     {
         // NOTE: the below "zombie mode" isn't accurate for each revision.
         // This causes ticks in zelda as it triggers zombie 2 repeatedly.
         // However, this fixes the fan favourite, Prehistorik Man.
-        struct GbApuEnvelope* env = &apu->env[num];
+        GbApuEnvelope* env = &apu->env[num];
         const unsigned old_period = old_value & 0x7;
         const unsigned old_mode = old_value & 0x8;
         const unsigned new_mode = new_value & 0x8;
@@ -972,7 +1014,6 @@ static void env_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old
 
         env->volume &= 0xF;
     }
-#endif
 
     if (!channel_is_dac_enabled(apu, num))
     {
@@ -982,7 +1023,7 @@ static void env_write(GbApu* apu, unsigned num, unsigned new_value, unsigned old
 
 static void trigger(GbApu* apu, unsigned num, unsigned time)
 {
-    struct GbApuChannel* c = &apu->channels[num];
+    GbApuChannel* c = &apu->channels[num];
     const unsigned new_freq = channel_get_frequency(apu, num);
     const bool was_enabled = channel_is_enabled(apu, num);
 
@@ -1018,12 +1059,12 @@ static void trigger(GbApu* apu, unsigned num, unsigned time)
 
         if (num == ChannelType_NOISE)
         {
-            apu->noise.lfsr = 0x7FFF;
+            apu->noise.lfsr = 0;
             c->frequency_timer = new_freq;
         }
         else // square0 | square1
         {
-            // keep lower 2 bits
+            // keep lower 2 bits (todo: verify on agb).
             c->frequency_timer = (c->frequency_timer & 0x3) | (new_freq & ~0x3);
 
             if (num == ChannelType_SQUARE0)
@@ -1117,19 +1158,28 @@ static void frame_sequencer_clock_env(GbApu* apu, unsigned time)
     env_clock(apu, ChannelType_NOISE, time);
 }
 
-static unsigned fifo_get_size(const struct GbApuFifo* fifo)
+static unsigned fifo_get_size(const GbApuFifo* fifo)
 {
     return (fifo->w_index - fifo->r_index) % FIFO_CAPACITY;
 }
 
-static void fifo_reset(struct GbApuFifo* fifo)
+static void fifo_reset(GbApuFifo* fifo)
 {
     fifo->r_index = fifo->w_index = 0;
 }
 
-static struct GbApuFifo* fifo_from_addr(GbApu* apu, unsigned addr)
+static void fifo_write(GbApu* apu, unsigned addr, unsigned value, unsigned mask)
 {
-    return &apu->fifo[(addr & 0x4) == 0x4];
+    assert(apu_is_agb(apu) && "invalid access");
+    value <<= (addr & 0x3) * 8;
+    mask <<= (addr & 0x3) * 8;
+
+    GbApuFifo* fifo = &apu->fifo[(addr & 0x4) == 0x4];
+    const unsigned buf_word = fifo->ring_buf[fifo->w_index];
+    const unsigned result = (buf_word & ~mask) | (value & mask);
+
+    fifo->ring_buf[fifo->w_index] = result;
+    fifo->w_index = (fifo->w_index + 1) % FIFO_CAPACITY; // advance write pointer
 }
 
 #if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
@@ -1189,10 +1239,12 @@ void apu_quit(GbApu* apu)
 
 void apu_reset(GbApu* apu, enum GbApuType type)
 {
-    apu_clear_samples(apu);
     apu->type = type;
+    apu_clear_samples(apu);
     memset(&apu->channels, 0, sizeof(apu->channels));
     memset(&apu->sweep, 0, sizeof(apu->sweep));
+    memset(&apu->len, 0, sizeof(apu->len));
+    memset(&apu->env, 0, sizeof(apu->env));
     memset(&apu->square, 0, sizeof(apu->square));
     memset(&apu->wave, 0, sizeof(apu->wave));
     memset(&apu->noise, 0, sizeof(apu->noise));
@@ -1202,15 +1254,7 @@ void apu_reset(GbApu* apu, enum GbApuType type)
     apu->agb_soundbias = 0;
     memset(apu->io + 0x10, 0, 0x17);
     memcpy(REG_WAVE_TABLE, WAVE_RAM_INITIAL[type], sizeof(WAVE_RAM_INITIAL[type]));
-    apu->noise.lfsr = 0x7FFF;
-}
-
-void apu_update_timestamp(GbApu* apu, int time)
-{
-    for (unsigned i = 0; i < apu_array_size(apu->channels); i++)
-    {
-        apu->channels[i].timestamp += time;
-    }
+    memcpy(REG_WAVE_TABLE + sizeof(WAVE_RAM_INITIAL[type]), WAVE_RAM_INITIAL[type], sizeof(WAVE_RAM_INITIAL[type]));
 }
 
 unsigned apu_read_io(GbApu* apu, unsigned addr, unsigned time)
@@ -1220,12 +1264,11 @@ unsigned apu_read_io(GbApu* apu, unsigned addr, unsigned time)
 
     if (addr >= 0x30 && addr <= 0x3F)
     {
-        const bool bank_mode = REG_NR30 & 0x20;
-        if (apu_is_agb(apu) && !bank_mode)
+        if (apu_is_agb(apu))
         {
             // writes happen to the opposite bank.
             const bool bank_select = REG_NR30 & 0x40;
-            const unsigned offset = (bank_select ^ 1) ? 0 : 16;
+            const unsigned offset = (bank_select ^ 1) ? 16 : 0;
             return apu->io[addr + offset];
         }
         else
@@ -1268,13 +1311,14 @@ void apu_write_io(GbApu* apu, unsigned addr, unsigned value, unsigned time)
             const unsigned nr41 = REG_NR41;
 
             // reset everything aside from wave ram
-            memset(apu->io + 0x10, 0, 0x17);
+            memset(&apu->env, 0, sizeof(apu->env));
             memset(&apu->sweep, 0, sizeof(apu->sweep));
             memset(&apu->square, 0, sizeof(apu->square));
             memset(&apu->wave, 0, sizeof(apu->wave));
             memset(&apu->noise, 0, sizeof(apu->noise));
+            memset(&apu->fifo, 0, sizeof(apu->fifo));
             memset(&apu->frame_sequencer, 0, sizeof(apu->frame_sequencer));
-            memset(&apu->env, 0, sizeof(apu->env));
+            memset(apu->io + 0x10, 0, 0x17);
 
             if (apu_is_dmg(apu))
             {
@@ -1298,12 +1342,11 @@ void apu_write_io(GbApu* apu, unsigned addr, unsigned value, unsigned time)
     // wave ram is always accessable
     else if (addr >= 0x30 && addr <= 0x3F) // wave ram
     {
-        const bool bank_mode = REG_NR30 & 0x20;
-        if (apu_is_agb(apu) && !bank_mode)
+        if (apu_is_agb(apu))
         {
             // writes happen to the opposite bank.
             const bool bank_select = REG_NR30 & 0x40;
-            const unsigned offset = (bank_select ^ 1) ? 0 : 16;
+            const unsigned offset = (bank_select ^ 1) ? 16 : 0;
             apu->io[addr + offset] = value;
         }
         else
@@ -1403,8 +1446,8 @@ unsigned apu_cgb_read_pcm12(GbApu* apu, unsigned time)
     const bool square0_enabled = channel_is_enabled(apu, ChannelType_SQUARE0);
     const bool square1_enabled = channel_is_enabled(apu, ChannelType_SQUARE1);
 
-    const bool square0_duty = SQUARE_DUTY_CYCLES[apu->type][apu->io[SQAURE_DUTY_ADDR[0]] >> 6][apu->square[0].duty_index];
-    const bool square1_duty = SQUARE_DUTY_CYCLES[apu->type][apu->io[SQAURE_DUTY_ADDR[1]] >> 6][apu->square[1].duty_index];
+    const bool square0_duty = SQUARE_DUTY_CYCLES[apu->io[SQAURE_DUTY_ADDR[0]] >> 6][apu->square[0].duty_index];
+    const bool square1_duty = SQUARE_DUTY_CYCLES[apu->io[SQAURE_DUTY_ADDR[1]] >> 6][apu->square[1].duty_index];
     const unsigned square0_sample = apu->env[ChannelType_SQUARE0].volume;
     const unsigned square1_sample = apu->env[ChannelType_SQUARE1].volume;
 
@@ -1423,7 +1466,7 @@ unsigned apu_cgb_read_pcm34(GbApu* apu, unsigned time)
     const bool wave_enabled = channel_is_enabled(apu, ChannelType_WAVE);
     const bool noise_enabled = channel_is_enabled(apu, ChannelType_NOISE);
     const unsigned wave_sample = (apu->wave.position_counter & 0x1) ? apu->wave.sample_buffer & 0xF : apu->wave.sample_buffer >> 4;
-    const unsigned noise_sample = !(apu->noise.lfsr & 1) * apu->env[ChannelType_NOISE].volume;
+    const unsigned noise_sample = (apu->noise.lfsr & 0x1) * apu->env[ChannelType_NOISE].volume;
 
     unsigned value = wave_sample * wave_enabled * apu_is_enabled(apu) << 0;
     value |= noise_sample * noise_enabled * apu_is_enabled(apu) << 4;
@@ -1497,29 +1540,18 @@ void apu_agb_soundbias_write(GbApu* apu, unsigned value, unsigned time)
 // 8-bit writes use the previous 3 samples in the buffer
 void apu_agb_fifo_write8(GbApu* apu, unsigned addr, unsigned value)
 {
-    const struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
-    const unsigned bit_shift = (addr & 0x3) * 8;
-    const unsigned buf_word = fifo->ring_buf[fifo->w_index];
-    const unsigned result = (buf_word & ~(0xFF << bit_shift)) | (value << bit_shift);
-    apu_agb_fifo_write32(apu, addr, result);
+    fifo_write(apu, addr, value, 0xFF);
 }
 
 // 16-bit writes use the previous 1 sample in the buffer
 void apu_agb_fifo_write16(GbApu* apu, unsigned addr, unsigned value)
 {
-    const struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
-    const unsigned bit_shift = (addr & 0x2) * 8;
-    const unsigned buf_word = fifo->ring_buf[fifo->w_index];
-    const unsigned result = (buf_word & ~(0xFFFF << bit_shift)) | (value << bit_shift);
-    apu_agb_fifo_write32(apu, addr, result);
+    fifo_write(apu, addr & ~0x1, value, 0xFFFF);
 }
 
 void apu_agb_fifo_write32(GbApu* apu, unsigned addr, unsigned value)
 {
-    assert(apu_is_agb(apu) && "invalid access");
-    struct GbApuFifo* fifo = fifo_from_addr(apu, addr);
-    fifo->ring_buf[fifo->w_index] = value;
-    fifo->w_index = (fifo->w_index + 1) % FIFO_CAPACITY; // advance write pointer
+    fifo_write(apu, addr & ~0x3, value, 0xFFFFFFFF);
 }
 
 void apu_agb_timer_overflow(GbApu* apu, void* user, apu_agb_fifo_dma_request dma_callback, unsigned timer_num, unsigned time)
@@ -1529,7 +1561,7 @@ void apu_agb_timer_overflow(GbApu* apu, void* user, apu_agb_fifo_dma_request dma
 
     for (unsigned i = 0; i < apu_array_size(apu->fifo); i++)
     {
-        struct GbApuFifo* fifo = &apu->fifo[i];
+        GbApuFifo* fifo = &apu->fifo[i];
         const bool timer_select = i == 0 ? (reg & 0x400) : (reg & 0x4000);
         if (timer_select == timer_num)
         {
@@ -1581,21 +1613,6 @@ unsigned apu_agb_soundbias_read_raw(const GbApu* apu)
     return REG_SOUNDBIAS;
 }
 
-void apu_set_highpass_filter(GbApu* apu, enum GbApuFilter filter, double clock_rate, double sample_rate)
-{
-    apu_set_highpass_filter_custom(apu, CHARGE_FACTOR[filter], clock_rate, sample_rate);
-}
-
-void apu_set_highpass_filter_custom(GbApu* apu, double charge_factor, double clock_rate, double sample_rate)
-{
-#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
-    const double capacitor_charge = pow(apu_clamp(charge_factor, 0.0, 1.0), clock_rate / sample_rate);
-    const double fixed_point_scale = 1 << CAPACITOR_SCALE;
-    apu->capacitor_charge_factor = round(capacitor_charge * fixed_point_scale);
-    memset(apu->capacitor, 0, sizeof(apu->capacitor));
-#endif
-}
-
 void apu_set_channel_volume(GbApu* apu, unsigned channel_num, float volume)
 {
     apu->channel_volume[channel_num] = apu_clamp(volume, 0.0F, 1.0F);
@@ -1614,6 +1631,34 @@ void apu_set_bass(GbApu* apu, int frequency)
 void apu_set_treble(GbApu* apu, double treble_db)
 {
     blip_wrap_set_treble(apu->blip, treble_db);
+}
+
+void apu_set_highpass_filter(GbApu* apu, enum GbApuFilter filter, double clock_rate, double sample_rate)
+{
+    apu_set_highpass_filter_custom(apu, CHARGE_FACTOR[filter], clock_rate, sample_rate);
+}
+
+void apu_set_highpass_filter_custom(GbApu* apu, double charge_factor, double clock_rate, double sample_rate)
+{
+#if defined(GB_APU_HAS_MATH_H) && GB_APU_HAS_MATH_H
+    const double capacitor_charge = pow(apu_clamp(charge_factor, 0.0, 1.0), clock_rate / sample_rate);
+    const double fixed_point_scale = 1 << CAPACITOR_SCALE;
+    apu->capacitor_charge_factor = round(capacitor_charge * fixed_point_scale);
+    memset(apu->capacitor, 0, sizeof(apu->capacitor));
+#endif
+}
+
+void apu_set_zombie_mode(GbApu* apu, unsigned enable)
+{
+    apu->zombie_mode_enable = enable;
+}
+
+void apu_update_timestamp(GbApu* apu, int time)
+{
+    for (unsigned i = 0; i < apu_array_size(apu->channels); i++)
+    {
+        apu->channels[i].timestamp += time;
+    }
 }
 
 int apu_clocks_needed(const GbApu* apu, int sample_count)
@@ -1696,22 +1741,26 @@ unsigned apu_state_size(void)
     return offsetof(GbApu, blip);
 }
 
-int apu_save_state(const GbApu* apu, void* data, unsigned size)
+unsigned apu_save_state(const GbApu* apu, void* data, unsigned size)
 {
-    if (!data || size < apu_state_size())
+    const unsigned state_size = apu_state_size();
+    if (!data || size < state_size)
     {
-        return 1;
+        return 0;
     }
 
-    return !memcpy(data, apu, apu_state_size());
+    memcpy(data, apu, state_size);
+    return state_size;
 }
 
-int apu_load_state(GbApu* apu, const void* data, unsigned size)
+unsigned apu_load_state(GbApu* apu, const void* data, unsigned size)
 {
-    if (!data || size < apu_state_size())
+    const unsigned state_size = apu_state_size();
+    if (!data || size < state_size)
     {
-        return 1;
+        return 0;
     }
 
-    return !memcpy(apu, data, apu_state_size());
+    memcpy(apu, data, state_size);
+    return state_size;
 }

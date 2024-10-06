@@ -106,6 +106,8 @@ void apu_set_treble(GbApu*, double treble_db);
 void apu_set_highpass_filter(GbApu*, enum GbApuFilter filter, double clock_rate, double sample_rate);
 /* charge factor should be in the range 0.0 - 1.0. */
 void apu_set_highpass_filter_custom(GbApu*, double charge_factor, double clock_rate, double sample_rate);
+/* enable zombie mode, forcefully disabled in agb mode. */
+void apu_set_zombie_mode(GbApu*, unsigned enable);
 /* updates timestamp, useful if the time overflows. */
 void apu_update_timestamp(GbApu*, int time);
 
@@ -128,10 +130,10 @@ void apu_clear_samples(GbApu*);
 /* ------------------------- */
 /* returns the size needed for savestates. */
 unsigned apu_state_size(void);
-/* creates a savestate, returns 0 on success. */
-int apu_save_state(const GbApu*, void* data, unsigned size);
-/* loads a savestate, returns 0 on success. */
-int apu_load_state(GbApu*, const void* data, unsigned size);
+/* creates a savestate, returns 0 on faliure and apu_state_size() on success. */
+unsigned apu_save_state(const GbApu*, void* data, unsigned size);
+/* loads a savestate, returns 0 on faliure and apu_state_size() on success. */
+unsigned apu_load_state(GbApu*, const void* data, unsigned size);
 
 #ifdef __cplusplus
 }

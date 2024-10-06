@@ -10,7 +10,7 @@ using the latter will allow you to have bass and treble control, as well as soun
 
 The `C` version compiles down to ~40 KiB in release mode.
 
-The `CXX` version compiles down to ~71 KiB in release mode.
+The `CXX` version compiles down to ~50 KiB in release mode.
 
 ---
 
@@ -20,7 +20,7 @@ gb_apu passes all of [blarggs dmg_sound and cgb_sound tests](https://gbdev.gg8.s
 
 The level of accurary does depend on your emulation of the Gameboy timer. For example, the `apu_frame_sequencer_clock()` should be called on the falling edge (bit goes from 1 -> 0) of bit 4 of `DIV`. In double speed mode, this is the falling edge of bit 5. Be aware that DIV can be written to which sets `DIV` to 0, which could cause an early clock, or, result in no clocks if `DIV` is written to frequently.
 
-gb_apu currently doesn't accurately emulate ["zombie mode"](https://gbdev.gg8.se/wiki/articles/Gameboy_sound_hardware#Obscure_Behavior). Basic emulation of it exists, and can be enabled with `-DGB_APU_ZOMBIE=ON`.
+gb_apu currently doesn't accurately emulate ["zombie mode"](https://gbdev.gg8.se/wiki/articles/Gameboy_sound_hardware#Obscure_Behavior).
 
 ---
 
@@ -34,14 +34,14 @@ To add this to your project, add the following files depending on your language 
 ### C
 
 - gb_apu.c
-- blip_wrap.c
-- blip_buf.c
+- blargg/blip_wrap.c
+- blargg/blip_buf.c
 
 ### CPP
 
 - gb_apu.c
-- blip_wrap.cpp
-- Blip_Buffer.cpp
+- blargg/blip_wrap.cpp
+- blargg/Blip_Buffer.cpp
 
 ---
 
@@ -49,7 +49,6 @@ you can also use the included cmake file:
 
 ```cmake
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
-set(GB_APU_ZOMBIE OFF) # set ON for zombie mode emulation
 add_subdirectory(gb_apu)
 target_link_libraries(your_exe PRIVATE gb_apu)
 ```
@@ -61,11 +60,10 @@ include(FetchContent)
 
 FetchContent_Declare(gb_apu
     GIT_REPOSITORY https://github.com/ITotalJustice/gb_apu.git
-    GIT_TAG        v1.3.0
+    GIT_TAG        v1.4.0
 )
 
 set(GB_APU_CXX OFF) # set ON if wanting Blip_Buffer
-set(GB_APU_ZOMBIE OFF) # set ON for zombie mode emulation
 FetchContent_MakeAvailable(gb_apu)
 
 target_link_libraries(your_exe PRIVATE gb_apu)
