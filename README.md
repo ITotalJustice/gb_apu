@@ -73,10 +73,9 @@ target_link_libraries(your_exe PRIVATE gb_apu)
 
 ## License
 
-- gb_apu is licenced under MIT.
-- blip_buf and Blip_Buffer are licenced under LGPL.
+All code in this repo is licenced under MIT.
 
-If you cannot use gpl code in your project, create a `blip_wrap.c/cpp` file with your own bandlimited synthesis code, or remove all `blip_wrap_` functions from `gb_apu.c` and sample the channels however you wish.
+In an email exchange with blargg (Shay Green), he generously allowed for blip buf to be re-licensed under MIT.
 
 ---
 

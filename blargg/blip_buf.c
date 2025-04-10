@@ -7,16 +7,28 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Library Copyright (C) 2003-2009 Shay Green. This library is free software;
-you can redistribute it and/or modify it under the terms of the GNU Lesser
-General Public License as published by the Free Software Foundation; either
-version 2.1 of the License, or (at your option) any later version. This
-library is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more
-details. You should have received a copy of the GNU Lesser General Public
-License along with this module; if not, write to the Free Software Foundation,
-Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA */
+/* MIT License
+
+Copyright (c) 2003-2009 Shay Green
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
 
 #if defined (BLARGG_TEST) && BLARGG_TEST
 	#include "blargg_test.h"
@@ -109,12 +121,44 @@ static void check_assumptions( void )
 	assert( blip_max_frame <= (fixed_t) -1 >> time_bits );
 }
 
+static unsigned blip_alloc_size(int size)
+{
+	return sizeof(blip_t) + (size + buf_extra) * sizeof (buf_t);
+}
+
+unsigned blip_state_size(const blip_t* m)
+{
+	return blip_alloc_size(m->size);
+}
+
+int blip_save_state(const blip_t* m, void* buf, unsigned size)
+{
+	if (size < blip_state_size(m))
+	{
+		return 1;
+	}
+
+	memcpy(buf, m, blip_state_size(m));
+	return 0;
+}
+
+int blip_load_state(blip_t* m, const void* buf, unsigned size)
+{
+	if (size < blip_state_size(m))
+	{
+		return 1;
+	}
+
+	memcpy(m, buf, blip_state_size(m));
+	return 0;
+}
+
 blip_t* blip_new( int size )
 {
 	blip_t* m;
 	assert( size >= 0 );
 
-	m = (blip_t*) malloc( sizeof *m + (size + buf_extra) * sizeof (buf_t) );
+	m = (blip_t*) malloc( blip_alloc_size(size) );
 	if ( m )
 	{
 		m->factor = time_unit / blip_max_ratio;

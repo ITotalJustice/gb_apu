@@ -61,6 +61,24 @@ int blip_read_samples( blip_t*, short out [], int count, int stereo );
 /** Frees buffer. No effect if NULL is passed. */
 void blip_delete( blip_t* );
 
+/**
+ * Savestate API, added by TotalJustice.
+ *
+ * This api should only be used for creating a savestate to be loaded on the same system.
+ * For example, if implementing runahead where frequent state save / load is implemented.
+ * In the above example, it was impossible to completely restore state as blip is modified.
+ *
+ * The below implements a basic state save / load by simply memcpy the entire blip struct.
+ */
+
+/* Returns the size required for creating a savestate */
+unsigned blip_state_size(const blip_t* m);
+
+/* Creates a savestate, size must >= blip_state_size(). Returns 0 on success. */
+int blip_save_state(const blip_t* m, void* buf, unsigned size);
+
+/* Loads a savestate, size must >= blip_state_size(). Returns 0 on success. */
+int blip_load_state(blip_t* m, const void* buf, unsigned size);
 
 /* Deprecated */
 typedef blip_t blip_buffer_t;
